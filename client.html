@@ -7,9 +7,12 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="/socket.io/socket.io.js"></script>
     <style>
-        body { margin: 0; overflow: hidden; background-color: #121212; color: #e0e0e0; font-family: 'Segoe UI', sans-serif; }
-        canvas { display: block; background-color: #1a1a1a; cursor: crosshair; }
-        #ui-layer { position: absolute; top: 10px; left: 10px; pointer-events: none; max-height: calc(100vh - 20px); overflow-y: auto; }
+        * { box-sizing: border-box; }
+        html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background-color: #121212; color: #e0e0e0; font-family: 'Segoe UI', sans-serif; }
+        body { display: flex; justify-content: center; align-items: center; }
+        #canvas-container { display: flex; justify-content: center; align-items: center; }
+        canvas { display: block; background-color: #1a1a1a; cursor: crosshair; border: 2px solid #333; border-radius: 4px; }
+        #ui-layer { position: fixed; top: 10px; left: 10px; pointer-events: none; max-height: calc(100vh - 20px); overflow-y: auto; z-index: 100; }
         .panel { background: rgba(0, 0, 0, 0.9); padding: 15px; border-radius: 8px; pointer-events: auto; margin-bottom: 10px; border: 1px solid #444; max-width: 350px; box-shadow: 0 4px 6px rgba(0,0,0,0.5); }
         .panel.collapsed .panel-content { display: none; }
         .panel-header { display: flex; justify-content: space-between; align-items: center; cursor: pointer; user-select: none; }
@@ -33,7 +36,7 @@
         .legend-item { display: flex; align-items: center; margin-bottom: 4px; font-size: 0.8rem; }
         .dot { width: 12px; height: 12px; border-radius: 2px; margin-right: 8px; display: inline-block;}
         .specs-tag { background: #333; padding: 2px 6px; border-radius: 4px; font-size: 0.7rem; color: #00ff00; margin-left: 5px; }
-        .connection-status { position: absolute; top: 10px; right: 10px; background: rgba(0,0,0,0.9); padding: 8px 12px; border-radius: 4px; font-size: 0.8rem; border: 1px solid #444; }
+        .connection-status { position: fixed; top: 10px; right: 10px; background: rgba(0,0,0,0.9); padding: 8px 12px; border-radius: 4px; font-size: 0.8rem; border: 1px solid #444; z-index: 100; }
         .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 5px; }
         .connected { background: #22c55e; }
         .disconnected { background: #ef4444; }
@@ -46,7 +49,9 @@
 </head>
 <body>
 
-    <canvas id="simCanvas"></canvas>
+    <div id="canvas-container">
+        <canvas id="simCanvas"></canvas>
+    </div>
 
     <div class="connection-status">
         <span class="status-dot disconnected" id="status-dot"></span>
@@ -143,9 +148,10 @@
     </div>
 
 <script>
-const METERS_TO_PIXELS = 40; 
-const GRID_RES = 0.10; 
-const PIXELS_PER_GRID = GRID_RES * METERS_TO_PIXELS;
+// スケール設定（サーバーから動的に更新される）
+let METERS_TO_PIXELS = 100;  // デフォルト: 100 px/m (1000px = 10m)
+let GRID_RES = 0.05; 
+let PIXELS_PER_GRID = GRID_RES * METERS_TO_PIXELS;
 
 // WebSocket接続
 const socket = io();
@@ -153,13 +159,17 @@ const socket = io();
 // Canvas setup
 const canvas = document.getElementById('simCanvas');
 const ctx = canvas.getContext('2d');
-canvas.width = window.innerWidth;
-canvas.height = window.innerHeight;
+// キャンバスサイズはマップ読み込み時に設定される
+let canvasWidth = 1000;
+let canvasHeight = 1000;
+canvas.width = canvasWidth;
+canvas.height = canvasHeight;
 
 // State
 let gameState = null;
 let interactionMode = 'GOAL'; // 'GOAL' or 'INIT_POSE'
 let dragStart = null, dragEnd = null;
+let robotConfig = null; // ロボット設定を保存
 
 // Connection status
 socket.on('connect', () => {
@@ -182,11 +192,12 @@ async function loadRobotConfig() {
     try {
         const response = await fetch('/api/config');
         if (response.ok) {
-            const config = await response.json();
-            if (config.lidar) {
-                document.getElementById('lidar-offset-x').textContent = (config.lidar.offsetX_M || 0).toFixed(2);
-                document.getElementById('lidar-offset-y').textContent = (config.lidar.offsetY_M || 0).toFixed(2);
+            robotConfig = await response.json();
+            if (robotConfig.lidar) {
+                document.getElementById('lidar-offset-x').textContent = (robotConfig.lidar.offsetX_M || 0).toFixed(2);
+                document.getElementById('lidar-offset-y').textContent = (robotConfig.lidar.offsetY_M || 0).toFixed(2);
             }
+            console.log('Robot config loaded:', robotConfig);
         }
     } catch (error) {
         console.error('Failed to load robot config:', error);
@@ -197,6 +208,28 @@ async function loadRobotConfig() {
 socket.on('init', (state) => {
     console.log('Received initial state', state);
     gameState = state;
+    
+    // サーバーからスケール情報を受け取る
+    if (state.metersToPixels) {
+        METERS_TO_PIXELS = state.metersToPixels;
+        PIXELS_PER_GRID = GRID_RES * METERS_TO_PIXELS;
+        console.log(`Scale updated: ${METERS_TO_PIXELS} px/m`);
+    }
+    
+    // キャンバスサイズをマップに合わせる（固定サイズ）
+    if (state.walls && state.walls.length > 0) {
+        let maxX = 0, maxY = 0;
+        state.walls.forEach(w => {
+            maxX = Math.max(maxX, w.p1.x, w.p2.x);
+            maxY = Math.max(maxY, w.p1.y, w.p2.y);
+        });
+        if (maxX > 100 && maxY > 100) {
+            canvasWidth = maxX + 50;
+            canvasHeight = maxY + 50;
+            canvas.width = canvasWidth;
+            canvas.height = canvasHeight;
+        }
+    }
     
     // 初期位置情報を表示
     if (state.initialPose) {
@@ -276,10 +309,11 @@ socket.on('state', (state) => {
 // Goal設定結果
 socket.on('goalResult', (result) => {
     if (result.success) {
-        console.log('Path found:', result.pathLength, 'points');
+        console.log('✅ Path found:', result.pathLength, 'points');
     } else {
-        console.log('Path planning failed:', result.message);
-        alert('経路が見つかりませんでした');
+        console.log('❌ Path planning failed:', result.message);
+        // より詳細なエラーメッセージを表示
+        alert('経路計画失敗:\n' + result.message);
     }
 });
 
@@ -359,47 +393,60 @@ function draw() {
         ctx.fillRect(p.x - 1, p.y - 1, 2, 2);
     }
     
-    // 6. Robot (True position)
+    // 6. Robot (True position) - 正方形ロボット
     const pos = gameState.robot.pose;
+    // ロボットサイズを設定ファイルから取得（500mm = 0.5m）
+    const robotWidthM = robotConfig?.robot?.widthM || 0.5;
+    const robotLengthM = robotConfig?.robot?.lengthM || 0.5;
+    const robotWidthPx = robotWidthM * METERS_TO_PIXELS;
+    const robotLengthPx = robotLengthM * METERS_TO_PIXELS;
+    
     ctx.save();
     ctx.translate(pos.x, pos.y);
     ctx.rotate(pos.theta);
     
-    // ロボット本体
+    // ロボット本体（正方形）
     ctx.fillStyle = '#22c55e';
-    ctx.beginPath();
-    ctx.arc(0, 0, gameState.robot.radius, 0, Math.PI * 2);
-    ctx.fill();
+    ctx.fillRect(-robotLengthPx/2, -robotWidthPx/2, robotLengthPx, robotWidthPx);
     
-    // 方向マーカー
+    // 枠線
     ctx.strokeStyle = '#000';
     ctx.lineWidth = 2;
+    ctx.strokeRect(-robotLengthPx/2, -robotWidthPx/2, robotLengthPx, robotWidthPx);
+    
+    // 方向マーカー（前方を示す矢印）
+    ctx.fillStyle = '#000';
     ctx.beginPath();
-    ctx.moveTo(0, 0);
-    ctx.lineTo(gameState.robot.radius, 0);
-    ctx.stroke();
+    ctx.moveTo(robotLengthPx/2, 0);
+    ctx.lineTo(robotLengthPx/2 - 10, -8);
+    ctx.lineTo(robotLengthPx/2 - 10, 8);
+    ctx.closePath();
+    ctx.fill();
     
     // LiDAR位置表示（小さな点）
+    const lidarOffsetXM = robotConfig?.lidar?.offsetX_M || 0.1;
+    const lidarOffsetYM = robotConfig?.lidar?.offsetY_M || 0;
+    const lidarOffsetXPx = lidarOffsetXM * METERS_TO_PIXELS;
+    const lidarOffsetYPx = lidarOffsetYM * METERS_TO_PIXELS;
     ctx.fillStyle = '#ff0000';
     ctx.beginPath();
-    ctx.arc(4, 0, 3, 0, Math.PI * 2); // offsetX_M * METERS_TO_PIXELS ≈ 4
+    ctx.arc(lidarOffsetXPx, lidarOffsetYPx, 4, 0, Math.PI * 2);
     ctx.fill();
     
     ctx.restore();
     
-    // 7. Estimate
+    // 7. Estimate（推定位置も正方形で表示）
     const est = gameState.estimate;
     ctx.save();
     ctx.translate(est.x, est.y);
     ctx.rotate(est.theta);
     ctx.strokeStyle = 'cyan';
     ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.arc(0, 0, gameState.robot.radius + 5, 0, Math.PI * 2);
-    ctx.stroke();
+    ctx.strokeRect(-robotLengthPx/2 - 3, -robotWidthPx/2 - 3, robotLengthPx + 6, robotWidthPx + 6);
+    // 方向マーカー
     ctx.beginPath();
     ctx.moveTo(0, 0);
-    ctx.lineTo(gameState.robot.radius + 8, 0);
+    ctx.lineTo(robotLengthPx/2 + 10, 0);
     ctx.stroke();
     ctx.restore();
     
@@ -578,11 +625,7 @@ canvas.addEventListener('mouseup', e => {
     }
 });
 
-window.addEventListener('resize', () => {
-    canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight;
-    resetSimulation();
-});
+// リサイズ時はキャンバスサイズを維持（マップサイズに固定）
 
 // Animation loop for smooth rendering
 function animate() {

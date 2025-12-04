@@ -1,11 +1,12 @@
 /**
- * LiDAR Simulation Engine (Omni-wheel Ready) - Optimized Version
+ * LiDAR Simulation Engine - Lightweight Optimized Version
  * 
- * 修正内容:
- * - 自己位置推定のバグ修正
- * - A*経路計画の最適化（フリーズ防止）
- * - パーティクルフィルタの軽量化
- * - 4輪オムニホイール対応の実用化準備
+ * 最適化内容:
+ * - パーティクル数削減 (50個)
+ * - LiDARレイ数削減 (180本)
+ * - 更新頻度最適化
+ * - 画像サイズベースのスケーリング (1000px = 10m)
+ * - 最大速度 10m/s 対応
  */
 const fs = require('fs');
 const path = require('path');
@@ -14,58 +15,64 @@ const path = require('path');
 const CONFIG_PATH = path.join(__dirname, 'robot-config.json');
 let ROBOT_CONF = {
     robot: { radiusM: 0.15 },
-    lidar: { offsetX_M: 0, offsetY_M: 0, offsetTheta_Rad: 0, numRays: 450, maxRangeM: 12.0, minRangeM: 0.02 },
-    kinematics: { maxSpeedMps: 1.0, maxRotationRadps: 2.0 },
-    safety: { wallMarginM: 0.30, minPassageWidthM: 0.45 },
+    lidar: { offsetX_M: 0, offsetY_M: 0, offsetTheta_Rad: 0, numRays: 180, maxRangeM: 12.0, minRangeM: 0.02 },
+    kinematics: { maxSpeedMps: 10.0, maxRotationRadps: 6.0 },
+    safety: { wallMarginM: 0.20, minPassageWidthM: 0.40 },
     localization: { 
-        particleCount: 300, 
-        particleLidarRays: 36,
-        initialPoseUncertaintyM: 0.15,
-        initialPoseUncertaintyRad: 0.1,
-        motionNoiseXY: 0.03,
-        motionNoiseTheta: 0.02,
-        sensorNoisePx: 0.8
+        particleCount: 50, 
+        particleLidarRays: 18,
+        initialPoseUncertaintyM: 0.10,
+        initialPoseUncertaintyRad: 0.05,
+        motionNoiseXY: 0.02,
+        motionNoiseTheta: 0.01,
+        sensorNoisePx: 0.5
     },
     control: {
-        lookAheadDistM: 0.4,
-        goalToleranceM: 0.05,
-        linearPGain: 2.0,
-        angularPGain: 3.0
+        lookAheadDistM: 0.5,
+        goalToleranceM: 0.08,
+        linearPGain: 5.0,
+        angularPGain: 6.0
+    },
+    mapScale: {
+        pixelsPerMeter: 100
     }
 };
 
 try {
     if (fs.existsSync(CONFIG_PATH)) {
         const loadedConf = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-        // 新しい設定形式に対応しつつ、古い形式もサポート
         if (loadedConf.robot) {
             ROBOT_CONF = loadedConf;
-        } else {
-            // 旧形式から変換
-            ROBOT_CONF.robot = { radiusM: loadedConf.radiusM || 0.15 };
-            ROBOT_CONF.lidar = loadedConf.lidar || ROBOT_CONF.lidar;
-            ROBOT_CONF.kinematics = loadedConf.kinematics || ROBOT_CONF.kinematics;
-            ROBOT_CONF.safety = loadedConf.safety || ROBOT_CONF.safety;
         }
-        console.log('Loaded robot config:', JSON.stringify(ROBOT_CONF, null, 2));
+        console.log('Loaded robot config (lightweight mode)');
     }
 } catch (e) {
     console.error('Failed to load robot config, using defaults.', e);
 }
 
-const METERS_TO_PIXELS = 40;
-const GRID_RES = 0.10; // 10cm grid
-const PIXELS_PER_GRID = GRID_RES * METERS_TO_PIXELS;
+// スケール: 1000px = 10m → 100 px/m
+let METERS_TO_PIXELS = ROBOT_CONF.mapScale?.pixelsPerMeter || 100;
+const GRID_RES = 0.05; // 5cm grid (軽量化のため粗めに)
+let PIXELS_PER_GRID = GRID_RES * METERS_TO_PIXELS;
 
-// シミュレーション設定（robot-config.jsonから上書き）
+// 動的スケール設定関数
+function setScale(imageWidth, imageHeight, fieldWidthM = 10, fieldHeightM = 10) {
+    // 画像サイズから自動計算: 1000x1000 → 10m x 10m
+    METERS_TO_PIXELS = imageWidth / fieldWidthM;
+    PIXELS_PER_GRID = GRID_RES * METERS_TO_PIXELS;
+    console.log(`Scale set: ${METERS_TO_PIXELS.toFixed(1)} px/m (${imageWidth}x${imageHeight} = ${fieldWidthM}m x ${fieldHeightM}m)`);
+    return METERS_TO_PIXELS;
+}
+
+// シミュレーション設定（軽量化）
 const SIM_CONF = {
-    particleCount: ROBOT_CONF.localization?.particleCount || 300,
-    particleLidarRays: ROBOT_CONF.localization?.particleLidarRays || 36,
+    particleCount: ROBOT_CONF.localization?.particleCount || 50,
+    particleLidarRays: ROBOT_CONF.localization?.particleLidarRays || 18,
     dt: 0.05,
     noise: {
-        odom_xy: ROBOT_CONF.localization?.motionNoiseXY || 0.03,
-        odom_theta: ROBOT_CONF.localization?.motionNoiseTheta || 0.02,
-        lidar: (ROBOT_CONF.localization?.sensorNoisePx || 0.8)
+        odom_xy: ROBOT_CONF.localization?.motionNoiseXY || 0.02,
+        odom_theta: ROBOT_CONF.localization?.motionNoiseTheta || 0.01,
+        lidar: (ROBOT_CONF.localization?.sensorNoisePx || 0.5)
     }
 };
 
@@ -284,24 +291,60 @@ class Costmap {
     getCost(idx) {
         if (idx < 0 || idx >= this.distMap.length) return 255;
         const dist = this.distMap[idx];
-        const robotRadius = (ROBOT_CONF.robot?.radiusM || 0.15);
+        
+        // 正方形ロボットの場合、対角線の半分を使用（最大範囲）
+        const robotWidth = (ROBOT_CONF.robot?.widthM || 0.5);
+        const robotLength = (ROBOT_CONF.robot?.lengthM || 0.5);
+        // 正方形の対角線の半分 = sqrt(w^2 + l^2) / 2 ≈ 0.354m for 0.5x0.5
+        const robotDiagonalHalf = Math.sqrt(robotWidth * robotWidth + robotLength * robotLength) / 2;
+        
+        // デンジャラスゾーン: 壁から30cm
+        const dangerZone = 0.30;
+        // 最小クリアランス: ロボット対角線半分 + 安全マージン
+        const safetyMargin = (ROBOT_CONF.safety?.wallMarginM || 0.10);
+        const minClearance = robotDiagonalHalf + safetyMargin; // 約0.354 + 0.10 = 0.454m
         
         // 壁セルは通行不可
         if (this.isWall[idx]) return 255;
         
-        // ロボット半径より近いセルは通行不可（少しマージンを緩める）
-        if (dist < robotRadius * 0.6) return 255;
+        // ロボットが物理的に通過できない（壁からの距離 < ロボット対角線半分）
+        if (dist < robotDiagonalHalf) return 255;
         
-        // コスト計算（壁に近いほど高コスト）
-        const safeDist = 0.5; // 安全距離 (m) - 少し緩める
-        if (dist > safeDist) return 1;
+        // 最小クリアランス未満は通行不可
+        if (dist < minClearance) return 255;
         
-        const norm = Math.max(0, (safeDist - dist) / safeDist);
-        return Math.floor(norm * 50) + 1; // コストの上限を下げる
+        // デンジャラスゾーン（壁から30cm以内）は非常に高コスト - できるだけ避ける
+        const dangerClearance = robotDiagonalHalf + dangerZone; // 約0.654m
+        if (dist < dangerClearance) {
+            // デンジャラスゾーン内: コスト150-254（非常に高い）
+            const norm = (dangerClearance - dist) / (dangerClearance - minClearance);
+            return Math.floor(150 + norm * 100);
+        }
+        
+        // 理想的な距離（壁から50cm以上離れる）
+        const preferredDist = robotDiagonalHalf + 0.50;
+        if (dist > preferredDist) return 1; // 最低コスト
+        
+        // 通行可能だがやや高コスト（30-50cm範囲）
+        const norm = Math.max(0, (preferredDist - dist) / (preferredDist - dangerClearance));
+        return Math.floor(norm * 100) + 1;
     }
     
     isValid(idx) {
         return idx >= 0 && idx < this.distMap.length && this.getCost(idx) < 255;
+    }
+    
+    /**
+     * 指定位置にロボットが入れるか判定
+     */
+    canRobotFit(px, py) {
+        const gx = Math.floor(px / PIXELS_PER_GRID);
+        const gy = Math.floor(py / PIXELS_PER_GRID);
+        
+        if (gx < 0 || gx >= this.cols || gy < 0 || gy >= this.rows) return false;
+        
+        const idx = gy * this.cols + gx;
+        return this.isValid(idx);
     }
 }
 
@@ -312,32 +355,66 @@ class GlobalPlanner {
     }
     
     plan(startPx, goalPx) {
-        const sx = Math.floor(startPx.x / PIXELS_PER_GRID);
-        const sy = Math.floor(startPx.y / PIXELS_PER_GRID);
-        const gx = Math.floor(goalPx.x / PIXELS_PER_GRID);
-        const gy = Math.floor(goalPx.y / PIXELS_PER_GRID);
+        let sx = Math.floor(startPx.x / PIXELS_PER_GRID);
+        let sy = Math.floor(startPx.y / PIXELS_PER_GRID);
+        let gx = Math.floor(goalPx.x / PIXELS_PER_GRID);
+        let gy = Math.floor(goalPx.y / PIXELS_PER_GRID);
         
         // 境界チェック
         if (sx < 0 || sx >= this.cm.cols || sy < 0 || sy >= this.cm.rows) {
-            console.log('Start position out of bounds');
-            return null;
+            console.log('❌ Start position out of bounds');
+            return { path: null, error: 'スタート位置がマップ外です' };
         }
         if (gx < 0 || gx >= this.cm.cols || gy < 0 || gy >= this.cm.rows) {
-            console.log('Goal position out of bounds');
-            return null;
+            console.log('❌ Goal position out of bounds');
+            return { path: null, error: '目標位置がマップ外です' };
         }
         
-        const startIdx = sy * this.cm.cols + sx;
-        const goalIdx = gy * this.cm.cols + gx;
+        let startIdx = sy * this.cm.cols + sx;
+        let goalIdx = gy * this.cm.cols + gx;
         
-        if (!this.cm.isValid(goalIdx)) {
-            console.log('Goal is in obstacle');
-            return null;
+        // 正方形ロボットの対角線の半分を使用してクリアランス計算
+        const robotWidth = (ROBOT_CONF.robot?.widthM || 0.5);
+        const robotLength = (ROBOT_CONF.robot?.lengthM || 0.5);
+        const robotDiagonalHalf = Math.sqrt(robotWidth * robotWidth + robotLength * robotLength) / 2;
+        const safetyMargin = (ROBOT_CONF.safety?.wallMarginM || 0.10);
+        const minClearance = robotDiagonalHalf + safetyMargin;
+        
+        // スタート位置のチェック - 現在地からの場合は物理的に通れるかだけ確認
+        const startCost = this.cm.getCost(startIdx);
+        if (startCost >= 255) {
+            const startDist = this.cm.distMap[startIdx];
+            // スタート位置がダメな場合、近くの安全な位置を探す
+            const safeStart = this.findNearestSafeCell(sx, sy);
+            if (safeStart) {
+                console.log(`⚠️ Start adjusted from (${sx},${sy}) to (${safeStart.x},${safeStart.y})`);
+                sx = safeStart.x;
+                sy = safeStart.y;
+            } else {
+                console.log(`❌ Start is in obstacle or too close to wall (clearance: ${startDist.toFixed(2)}m, required: ${robotDiagonalHalf.toFixed(2)}m)`);
+                return { path: null, error: `スタート位置が壁に近すぎます` };
+            }
         }
-        if (!this.cm.isValid(startIdx)) {
-            console.log('Start is in obstacle');
-            return null;
+        
+        // ゴール位置のチェック
+        const goalCost = this.cm.getCost(goalIdx);
+        if (goalCost >= 255) {
+            const goalDist = this.cm.distMap[goalIdx];
+            // ゴール位置がダメな場合、近くの安全な位置を探す
+            const safeGoal = this.findNearestSafeCell(gx, gy);
+            if (safeGoal) {
+                console.log(`⚠️ Goal adjusted from (${gx},${gy}) to (${safeGoal.x},${safeGoal.y})`);
+                gx = safeGoal.x;
+                gy = safeGoal.y;
+            } else {
+                console.log(`❌ Goal is in obstacle or too close to wall (clearance: ${goalDist.toFixed(2)}m, required: ${robotDiagonalHalf.toFixed(2)}m)`);
+                return { path: null, error: `目標位置にロボットが入れません` };
+            }
         }
+        
+        // 更新後のインデックス
+        const actualStartIdx = sy * this.cm.cols + sx;
+        const actualGoalIdx = gy * this.cm.cols + gx;
         
         // A* with Priority Queue
         const openSet = new PriorityQueue();
@@ -345,8 +422,8 @@ class GlobalPlanner {
         const cameFrom = new Map();
         const gScore = new Map();
         
-        gScore.set(startIdx, 0);
-        openSet.push(startIdx, this.heuristic(sx, sy, gx, gy));
+        gScore.set(actualStartIdx, 0);
+        openSet.push(actualStartIdx, this.heuristic(sx, sy, gx, gy));
         
         // 8方向移動
         const neighbors = [
@@ -368,9 +445,9 @@ class GlobalPlanner {
             
             const currentIdx = current.index;
             
-            if (currentIdx === goalIdx) {
-                console.log(`Path found in ${iterations} iterations`);
-                return this.reconstructPath(cameFrom, currentIdx);
+            if (currentIdx === actualGoalIdx) {
+                console.log(`✅ Path found in ${iterations} iterations`);
+                return { path: this.reconstructPath(cameFrom, currentIdx), error: null };
             }
             
             if (closedSet.has(currentIdx)) continue;
@@ -393,7 +470,10 @@ class GlobalPlanner {
                 const cellCost = this.cm.getCost(neighborIdx);
                 if (cellCost >= 255) continue;
                 
-                const tentativeG = currentG + n.cost + (cellCost * 0.02);
+                // コストの重み: デンジャラスゾーン（高コスト）を強く避ける
+                // cellCost: 1-100は安全〜やや注意、150-254はデンジャラスゾーン
+                const costWeight = cellCost > 100 ? 0.5 : 0.1; // デンジャラスゾーンは5倍の重み
+                const tentativeG = currentG + n.cost + (cellCost * costWeight);
                 const existingG = gScore.get(neighborIdx);
                 
                 if (existingG === undefined || tentativeG < existingG) {
@@ -411,7 +491,35 @@ class GlobalPlanner {
             }
         }
         
-        console.log(`Path not found after ${iterations} iterations`);
+        console.log(`❌ Path not found after ${iterations} iterations (searched ${closedSet.size} cells)`);
+        return { path: null, error: 'ロボットサイズを考慮すると通れる経路がありません' };
+    }
+    
+    /**
+     * 指定位置の近くで安全なセルを探す
+     */
+    findNearestSafeCell(x, y, maxRadius = 10) {
+        // 螺旋状に探索
+        for (let r = 1; r <= maxRadius; r++) {
+            for (let dx = -r; dx <= r; dx++) {
+                for (let dy = -r; dy <= r; dy++) {
+                    if (Math.abs(dx) !== r && Math.abs(dy) !== r) continue; // 外周のみ
+                    
+                    const nx = x + dx;
+                    const ny = y + dy;
+                    
+                    if (nx < 0 || nx >= this.cm.cols || ny < 0 || ny >= this.cm.rows) continue;
+                    
+                    const idx = ny * this.cm.cols + nx;
+                    const cost = this.cm.getCost(idx);
+                    
+                    // 安全なセル（コストが低い）を見つけた
+                    if (cost < 100) {
+                        return { x: nx, y: ny };
+                    }
+                }
+            }
+        }
         return null;
     }
     
@@ -463,22 +571,28 @@ class GlobalPlanner {
     
     /**
      * 2点間に障害物がないか確認（Line of Sight）
+     * ロボットサイズを考慮した安全な通行可否チェック
      */
     hasLineOfSight(p1, p2) {
         const dx = p2.x - p1.x;
         const dy = p2.y - p1.y;
         const dist = Math.hypot(dx, dy);
-        const steps = Math.ceil(dist / (PIXELS_PER_GRID * 0.5));
+        const steps = Math.ceil(dist / (PIXELS_PER_GRID * 0.3)); // より細かくチェック
         
         if (steps === 0) return true;
         
         const stepX = dx / steps;
         const stepY = dy / steps;
         
-        // ロボット半径分のマージンを考慮
-        const robotRadius = (ROBOT_CONF.robot?.radiusM || 0.15);
+        // 正方形ロボットの対角線の半分 + 安全マージン + デンジャラスゾーン
+        const robotWidth = (ROBOT_CONF.robot?.widthM || 0.5);
+        const robotLength = (ROBOT_CONF.robot?.lengthM || 0.5);
+        const robotDiagonalHalf = Math.sqrt(robotWidth * robotWidth + robotLength * robotLength) / 2;
+        const safetyMargin = (ROBOT_CONF.safety?.wallMarginM || 0.10);
+        const dangerZone = 0.30; // 壁から30cmのデンジャラスゾーン
+        const minClearance = robotDiagonalHalf + safetyMargin; // 最低限必要な距離
         
-        for (let i = 1; i < steps; i++) {
+        for (let i = 0; i <= steps; i++) {
             const x = p1.x + stepX * i;
             const y = p1.y + stepY * i;
             
@@ -490,10 +604,10 @@ class GlobalPlanner {
             }
             
             const idx = gy * this.cm.cols + gx;
-            const dist = this.cm.distMap[idx];
+            const wallDist = this.cm.distMap[idx];
             
-            // 壁からの距離がロボット半径より小さい場合は通過不可
-            if (dist < robotRadius) {
+            // 壁からの距離が最低限必要な距離より小さい場合は通過不可
+            if (wallDist < minClearance) {
                 return false;
             }
         }
@@ -665,6 +779,13 @@ class Robot {
         this.pose = { x, y, theta };
         this.radius = (ROBOT_CONF.robot?.radiusM || 0.15) * METERS_TO_PIXELS;
         
+        // ロボットの幅・長さ（正方形なので同じ値）
+        this.widthM = ROBOT_CONF.robot?.widthM || 0.5;
+        this.lengthM = ROBOT_CONF.robot?.lengthM || 0.5;
+        this.width = this.widthM * METERS_TO_PIXELS;
+        this.length = this.lengthM * METERS_TO_PIXELS;
+        this.shape = ROBOT_CONF.robot?.shape || 'square';
+        
         // LiDAR設定
         const lidarRays = useImageMap ? 180 : (ROBOT_CONF.lidar?.numRays || 450);
         this.lidar = new Lidar(lidarRays, (ROBOT_CONF.lidar?.maxRangeM || 12.0) * METERS_TO_PIXELS);
@@ -707,27 +828,99 @@ class Robot {
         const nextY = this.pose.y + globalDy * METERS_TO_PIXELS;
         const nextTheta = MathUtils.normalizeAngle(this.pose.theta + dtheta);
 
-        // 簡易衝突判定
+        // 壁との衝突判定（正方形ロボット対応）
+        const margin = (ROBOT_CONF.safety?.wallMarginM || 0.05) * METERS_TO_PIXELS; // 50mm余裕
+        // 正方形ロボットの対角線の半分を衝突判定用の半径として使用
+        const halfWidth = this.width / 2;
+        const halfLength = this.length / 2;
+        const diagonalHalf = Math.sqrt(halfWidth * halfWidth + halfLength * halfLength);
+        const collisionRadius = diagonalHalf + margin;
+        
         let collision = false;
-        if (nextX < this.radius || nextX > this.canvasWidth - this.radius ||
-            nextY < this.radius || nextY > this.canvasHeight - this.radius) {
+        
+        // 境界判定
+        if (nextX < collisionRadius || nextX > this.canvasWidth - collisionRadius ||
+            nextY < collisionRadius || nextY > this.canvasHeight - collisionRadius) {
             collision = true;
         }
         
-        if (!collision) {
+        // 壁との衝突判定（正方形の4隅と中央の辺をチェック）
+        let minWallDist = Infinity;
+        if (!collision && walls.length > 0) {
+            const nextCos = Math.cos(nextTheta);
+            const nextSin = Math.sin(nextTheta);
+            
+            // 正方形の4隅と4辺の中点をチェック
+            const checkPoints = [
+                { dx: halfWidth, dy: halfLength },
+                { dx: halfWidth, dy: -halfLength },
+                { dx: -halfWidth, dy: halfLength },
+                { dx: -halfWidth, dy: -halfLength },
+                { dx: halfWidth, dy: 0 },
+                { dx: -halfWidth, dy: 0 },
+                { dx: 0, dy: halfLength },
+                { dx: 0, dy: -halfLength }
+            ];
+            
+            for (const point of checkPoints) {
+                const cx = nextX + (point.dx * nextCos - point.dy * nextSin);
+                const cy = nextY + (point.dx * nextSin + point.dy * nextCos);
+                
+                // 各壁との距離をチェック
+                for (const wall of walls) {
+                    const dist = this.pointToSegmentDistance(cx, cy, wall.p1.x, wall.p1.y, wall.p2.x, wall.p2.y);
+                    minWallDist = Math.min(minWallDist, dist);
+                    if (dist < margin * 0.5) { // 衝突判定はより厳しく
+                        collision = true;
+                        break;
+                    }
+                }
+                if (collision) break;
+            }
+        }
+        
+        // 衝突した場合でも回転は許可（その場で方向転換可能に）
+        if (collision) {
+            // 移動は止めるが、回転だけは許可
+            this.pose.theta = nextTheta;
+            return {
+                dx: 0,
+                dy: 0,
+                dtheta: dtheta,
+                collision: true
+            };
+        } else {
             this.pose.x = nextX;
             this.pose.y = nextY;
             this.pose.theta = nextTheta;
+            return {
+                dx: dx_local,
+                dy: dy_local,
+                dtheta: dtheta,
+                collision: false
+            };
         }
-
-        // オドメトリ（真の移動量を返す）
-        // 注意: ノイズはパーティクルフィルタの予測ステップで追加する
-        // ここでノイズを追加するとパーティクルフィルタで二重にノイズが加わる
-        return {
-            dx: dx_local,       // ローカル座標系での移動量 (m)
-            dy: dy_local,       // ローカル座標系での移動量 (m)
-            dtheta: dtheta      // 角度変化 (rad)
-        };
+    }
+    
+    /**
+     * 点から線分への最短距離を計算
+     */
+    pointToSegmentDistance(px, py, x1, y1, x2, y2) {
+        const dx = x2 - x1;
+        const dy = y2 - y1;
+        const lengthSq = dx * dx + dy * dy;
+        
+        if (lengthSq === 0) {
+            return Math.hypot(px - x1, py - y1);
+        }
+        
+        let t = ((px - x1) * dx + (py - y1) * dy) / lengthSq;
+        t = Math.max(0, Math.min(1, t));
+        
+        const nearestX = x1 + t * dx;
+        const nearestY = y1 + t * dy;
+        
+        return Math.hypot(px - nearestX, py - nearestY);
     }
 }
 
@@ -1042,8 +1235,12 @@ class SimulationEngine {
      * 安全な初期位置を自動で見つける
      */
     findSafeInitialPosition() {
-        const robotRadius = (ROBOT_CONF.robot?.radiusM || 0.15);
-        const minDist = robotRadius + 0.3; // 壁から30cm以上離れた位置
+        // 正方形ロボットの対角線の半分を使用
+        const robotWidth = (ROBOT_CONF.robot?.widthM || 0.5);
+        const robotLength = (ROBOT_CONF.robot?.lengthM || 0.5);
+        const robotDiagonalHalf = Math.sqrt(robotWidth * robotWidth + robotLength * robotLength) / 2;
+        const safetyMargin = (ROBOT_CONF.safety?.wallMarginM || 0.10);
+        const minDist = robotDiagonalHalf + safetyMargin + 0.1; // 追加で10cm余裕
         
         // コストマップから安全な位置を探索
         let bestX = this.canvasWidth * 0.2;
@@ -1100,16 +1297,20 @@ class SimulationEngine {
     setGoal(goalX, goalY) {
         const est = this.particleFilter.getEstimate();
         
-        console.log(`Planning path from (${est.x.toFixed(0)}, ${est.y.toFixed(0)}) to (${goalX.toFixed(0)}, ${goalY.toFixed(0)})`);
+        console.log(`🎯 Planning path from (${(est.x/METERS_TO_PIXELS).toFixed(2)}m, ${(est.y/METERS_TO_PIXELS).toFixed(2)}m) to (${(goalX/METERS_TO_PIXELS).toFixed(2)}m, ${(goalY/METERS_TO_PIXELS).toFixed(2)}m)`);
         
-        const path = this.planner.plan({x: est.x, y: est.y}, {x: goalX, y: goalY});
+        const result = this.planner.plan({x: est.x, y: est.y}, {x: goalX, y: goalY});
         
-        if (path) {
-            this.robot.path = path;
+        if (result && result.path) {
+            this.robot.path = result.path;
             this.robot.pathIndex = 0;
-            return { success: true, pathLength: path.length };
+            return { success: true, pathLength: result.path.length };
         }
-        return { success: false, message: "No path found" };
+        
+        // エラーメッセージを返す
+        const errorMsg = result?.error || '経路が見つかりません';
+        console.log(`❌ ${errorMsg}`);
+        return { success: false, message: errorMsg };
     }
     
     setInitialPose(x, y, theta) {
@@ -1230,6 +1431,31 @@ class SimulationEngine {
         // ロボットを移動させる & オドメトリ取得
         const odomDelta = this.robot.move(ctrl.vx, ctrl.vy, ctrl.omega, dt, this.world.walls);
         
+        // 衝突カウンタの管理（スタック検出用）
+        if (!this.collisionCounter) this.collisionCounter = 0;
+        if (!this.lastPosition) this.lastPosition = { x: this.robot.pose.x, y: this.robot.pose.y };
+        
+        if (odomDelta.collision) {
+            this.collisionCounter++;
+            // 連続で衝突した場合、パスを再計画
+            if (this.collisionCounter > 20 && this.robot.path && this.robot.path.length > 0) {
+                console.log('⚠️ Stuck detected, replanning path...');
+                const goal = this.robot.path[this.robot.path.length - 1];
+                this.setGoal(goal.x, goal.y);
+                this.collisionCounter = 0;
+            }
+        } else {
+            // 移動できた場合はカウンタリセット
+            const moved = Math.hypot(
+                this.robot.pose.x - this.lastPosition.x,
+                this.robot.pose.y - this.lastPosition.y
+            );
+            if (moved > 1) { // 1ピクセル以上移動した
+                this.collisionCounter = 0;
+                this.lastPosition = { x: this.robot.pose.x, y: this.robot.pose.y };
+            }
+        }
+        
         // パーティクルフィルタ更新
         const moveThreshold = 0.001; // 1mm
         const rotThreshold = 0.001; // ~0.05度
@@ -1250,15 +1476,40 @@ class SimulationEngine {
         const est = this.particleFilter.getEstimate();
         const scan = this.robot.lidar.scan(this.robot.pose, this.world.walls, SIM_CONF.noise.lidar);
         
+        // 正方形ロボットのクリアランス計算
+        const robotWidth = (ROBOT_CONF.robot?.widthM || 0.5);
+        const robotLength = (ROBOT_CONF.robot?.lengthM || 0.5);
+        const robotDiagonalHalf = Math.sqrt(robotWidth * robotWidth + robotLength * robotLength) / 2;
+        const safetyMargin = (ROBOT_CONF.safety?.wallMarginM || 0.10);
+        const dangerZone = 0.30; // デンジャラスゾーン 30cm
+        
         return {
-            robot: { pose: this.robot.pose, radius: this.robot.radius },
+            robot: { 
+                pose: this.robot.pose, 
+                radius: this.robot.radius,
+                width: this.robot.width,
+                length: this.robot.length,
+                shape: this.robot.shape,
+                diagonalHalf: robotDiagonalHalf * METERS_TO_PIXELS
+            },
             estimate: est,
             particles: this.particleFilter.particles,
             scan: Array.from(scan),
             path: this.robot.path,
             walls: this.world.walls,
-            costmap: { cols: this.costmap.cols, rows: this.costmap.rows },
-            command: this.lastCommand, // マイコンへの指令値
+            costmap: { 
+                cols: this.costmap.cols, 
+                rows: this.costmap.rows,
+                gridSize: PIXELS_PER_GRID
+            },
+            dangerZoneM: dangerZone, // デンジャラスゾーン（メートル）
+            minClearanceM: robotDiagonalHalf + safetyMargin, // 最小クリアランス（メートル）
+            command: this.lastCommand,
+            metersToPixels: METERS_TO_PIXELS, // クライアントにスケール情報を送信
+            fieldSize: {
+                width: this.canvasWidth,
+                height: this.canvasHeight
+            },
             stats: {
                 posError: MathUtils.dist(this.robot.pose, est) / METERS_TO_PIXELS,
                 odomError: 0,
@@ -1269,4 +1520,4 @@ class SimulationEngine {
     }
 }
 
-module.exports = { SimulationEngine, METERS_TO_PIXELS, ROBOT_CONF };
+module.exports = { SimulationEngine, METERS_TO_PIXELS, ROBOT_CONF, setScale };

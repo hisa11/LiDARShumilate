@@ -76,8 +76,8 @@
             <div style="margin-top: 15px; font-size: 0.8rem; border-top: 1px solid #444; padding-top: 10px;">
                 <div class="legend-item"><div class="dot" style="background:rgba(255, 0, 0, 0.3);"></div>Danger Zone (30cm)</div>
                 <div class="legend-item"><div class="dot" style="background:#00ff00;"></div>Computed Path</div>
-                <div class="legend-item"><div class="dot" style="background:#22c55e; border-radius:50%;"></div>Robot (Green)</div>
-                <div class="legend-item"><div class="dot" style="background:#00ffff; border-radius:50%;"></div>Estimate (Blue)</div>
+                <div class="legend-item"><div class="dot" style="background:#22c55e;"></div>Robot (Green Square)</div>
+                <div class="legend-item"><div class="dot" style="background:transparent; border: 2px solid #00ffff;"></div>Estimate (Cyan)</div>
                 <div class="legend-item"><div class="dot" style="background:#ff3300; border-radius:50%;"></div>LiDAR Points</div>
             </div>
 
@@ -101,9 +101,8 @@
     </div>
 
 <script>
-const METERS_TO_PIXELS = 40; 
+let METERS_TO_PIXELS = 100; // サーバーから受信した値で更新される
 const GRID_RES = 0.10; 
-const PIXELS_PER_GRID = GRID_RES * METERS_TO_PIXELS;
 
 // WebSocket接続
 const socket = io();
@@ -118,7 +117,24 @@ canvas.height = window.innerHeight;
 let gameState = null;
 let interactionMode = 'GOAL'; // 'GOAL' or 'INIT_POSE'
 let dragStart = null, dragEnd = null;
-let showCostmap = false;
+let showCostmap = true; // デフォルトでデンジャラスゾーンを表示
+
+// フィールドオフセット（画面中央配置用）
+let fieldOffset = { x: 0, y: 0 };
+
+// フィールドオフセットを計算
+function calculateFieldOffset() {
+    if (!gameState || !gameState.fieldSize) {
+        fieldOffset = { x: 0, y: 0 };
+        return;
+    }
+    const fieldWidth = gameState.fieldSize.width;
+    const fieldHeight = gameState.fieldSize.height;
+    fieldOffset = {
+        x: (canvas.width - fieldWidth) / 2,
+        y: (canvas.height - fieldHeight) / 2
+    };
+}
 
 // Connection status
 socket.on('connect', () => {
@@ -137,6 +153,11 @@ socket.on('disconnect', () => {
 socket.on('init', (state) => {
     console.log('Received initial state', state);
     gameState = state;
+    // サーバーからのスケール情報を更新
+    if (state.metersToPixels) {
+        METERS_TO_PIXELS = state.metersToPixels;
+        console.log('Scale updated:', METERS_TO_PIXELS, 'px/m');
+    }
     draw();
     updateUI();
 });
@@ -144,6 +165,11 @@ socket.on('init', (state) => {
 // 状態更新
 socket.on('state', (state) => {
     gameState = state;
+    // サーバーからのスケール情報を更新
+    if (state.metersToPixels && state.metersToPixels !== METERS_TO_PIXELS) {
+        METERS_TO_PIXELS = state.metersToPixels;
+        console.log('Scale updated:', METERS_TO_PIXELS, 'px/m');
+    }
     draw();
     updateUI();
 });
@@ -177,34 +203,77 @@ socket.on('mapLoadResult', (result) => {
 function draw() {
     if (!gameState) return;
     
+    // フィールドオフセットを計算（画面中央配置）
+    calculateFieldOffset();
+    
     // 1. Background
     ctx.fillStyle = '#121212';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     
-    // 2. Grid
+    // 2. Grid（フィールド内のみ）
+    ctx.save();
+    ctx.translate(fieldOffset.x, fieldOffset.y);
+    
     ctx.strokeStyle = '#222';
     ctx.lineWidth = 1;
     ctx.beginPath();
-    for(let x = 0; x < canvas.width; x += METERS_TO_PIXELS) {
+    const fieldWidth = gameState.fieldSize?.width || canvas.width;
+    const fieldHeight = gameState.fieldSize?.height || canvas.height;
+    for(let x = 0; x <= fieldWidth; x += METERS_TO_PIXELS) {
         ctx.moveTo(x, 0);
-        ctx.lineTo(x, canvas.height);
+        ctx.lineTo(x, fieldHeight);
     }
-    for(let y = 0; y < canvas.height; y += METERS_TO_PIXELS) {
+    for(let y = 0; y <= fieldHeight; y += METERS_TO_PIXELS) {
         ctx.moveTo(0, y);
-        ctx.lineTo(canvas.width, y);
+        ctx.lineTo(fieldWidth, y);
     }
     ctx.stroke();
     
-    // 3. Danger Zone (Optional visualization)
-    if (showCostmap && gameState.costmap) {
-        ctx.fillStyle = 'rgba(255, 0, 0, 0.15)';
-        // Simple visualization - just show it's available
-        // Full costmap rendering would require distance map data
+    // フィールド境界線を描画
+    ctx.strokeStyle = '#444';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(0, 0, fieldWidth, fieldHeight);
+    
+    // 3. Danger Zone - 壁から30cm以内の危険エリアを表示
+    if (showCostmap && gameState.walls) {
+        const dangerZonePx = (gameState.dangerZoneM || 0.30) * METERS_TO_PIXELS;
+        const minClearancePx = (gameState.minClearanceM || 0.45) * METERS_TO_PIXELS;
+        
+        // デンジャラスゾーン（黄色）- 壁から30cm
+        ctx.strokeStyle = 'rgba(255, 200, 0, 0.4)';
+        ctx.lineWidth = dangerZonePx * 2;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.beginPath();
+        for(let w of gameState.walls) {
+            ctx.moveTo(w.p1.x, w.p1.y);
+            ctx.lineTo(w.p2.x, w.p2.y);
+        }
+        ctx.stroke();
+        
+        // 進入禁止ゾーン（赤）- ロボットが物理的に入れない
+        ctx.strokeStyle = 'rgba(255, 0, 0, 0.3)';
+        ctx.lineWidth = minClearancePx * 2;
+        ctx.beginPath();
+        for(let w of gameState.walls) {
+            ctx.moveTo(w.p1.x, w.p1.y);
+            ctx.lineTo(w.p2.x, w.p2.y);
+        }
+        ctx.stroke();
+        
+        // 外枠のデンジャラスゾーン
+        ctx.fillStyle = 'rgba(255, 200, 0, 0.2)';
+        ctx.fillRect(0, 0, fieldWidth, dangerZonePx); // 上
+        ctx.fillRect(0, fieldHeight - dangerZonePx, fieldWidth, dangerZonePx); // 下
+        ctx.fillRect(0, 0, dangerZonePx, fieldHeight); // 左
+        ctx.fillRect(fieldWidth - dangerZonePx, 0, dangerZonePx, fieldHeight); // 右
     }
     
     // 4. Walls
     ctx.strokeStyle = '#888';
     ctx.lineWidth = 3;
+    ctx.lineCap = 'butt';
+    ctx.lineJoin = 'miter';
     ctx.beginPath();
     for(let w of gameState.walls) {
         ctx.moveTo(w.p1.x, w.p1.y);
@@ -230,35 +299,52 @@ function draw() {
         ctx.fillRect(p.x - 1, p.y - 1, 2, 2);
     }
     
-    // 7. Robot (True position)
+    // 7. Robot (True position) - 正方形で描画
     const pos = gameState.robot.pose;
+    const robotWidth = gameState.robot.width || gameState.robot.radius * 2;
+    const robotLength = gameState.robot.length || gameState.robot.radius * 2;
     ctx.save();
     ctx.translate(pos.x, pos.y);
     ctx.rotate(pos.theta);
     ctx.fillStyle = '#22c55e';
-    ctx.beginPath();
-    ctx.arc(0, 0, gameState.robot.radius, 0, Math.PI * 2);
-    ctx.fill();
+    // 正方形ロボットを描画（中心を基準に）
+    ctx.fillRect(-robotWidth / 2, -robotLength / 2, robotWidth, robotLength);
+    // 向きを示す線
     ctx.strokeStyle = '#000';
+    ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.moveTo(0, 0);
-    ctx.lineTo(gameState.robot.radius, 0);
+    ctx.lineTo(robotWidth / 2 + 5, 0);
     ctx.stroke();
+    // 前面を示す三角形
+    ctx.fillStyle = '#000';
+    ctx.beginPath();
+    ctx.moveTo(robotWidth / 2, -5);
+    ctx.lineTo(robotWidth / 2 + 10, 0);
+    ctx.lineTo(robotWidth / 2, 5);
+    ctx.closePath();
+    ctx.fill();
     ctx.restore();
     
-    // 8. Estimate
+    // 8. Estimate - 正方形の枠で描画
     const est = gameState.estimate;
     ctx.save();
     ctx.translate(est.x, est.y);
     ctx.rotate(est.theta);
     ctx.strokeStyle = 'cyan';
     ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.arc(0, 0, gameState.robot.radius + 5, 0, Math.PI * 2);
-    ctx.stroke();
+    // 少し大きめの正方形枠
+    const estOffset = 5;
+    ctx.strokeRect(
+        -robotWidth / 2 - estOffset, 
+        -robotLength / 2 - estOffset, 
+        robotWidth + estOffset * 2, 
+        robotLength + estOffset * 2
+    );
+    // 向きを示す線
     ctx.beginPath();
     ctx.moveTo(0, 0);
-    ctx.lineTo(gameState.robot.radius + 8, 0);
+    ctx.lineTo(robotWidth / 2 + 12, 0);
     ctx.stroke();
     ctx.restore();
     
@@ -277,7 +363,10 @@ function draw() {
         ctx.fillRect(px - 1, py - 1, 2, 2);
     }
     
-    // 10. Drag for init pose
+    // フィールドオフセット用のtranslateを終了
+    ctx.restore();
+    
+    // 10. Drag for init pose（画面座標系で描画）
     if(interactionMode === 'INIT_POSE' && dragStart && dragEnd) {
         ctx.strokeStyle = '#eab308';
         ctx.lineWidth = 2;
@@ -376,16 +465,20 @@ function dist(p1, p2) {
 // Mouse events
 canvas.addEventListener('mousedown', e => {
     const r = canvas.getBoundingClientRect();
-    const x = e.clientX - r.left;
-    const y = e.clientY - r.top;
+    const screenX = e.clientX - r.left;
+    const screenY = e.clientY - r.top;
+    
+    // 画面座標からフィールド座標に変換
+    const x = screenX - fieldOffset.x;
+    const y = screenY - fieldOffset.y;
     
     if(interactionMode === 'GOAL') {
-        // Send goal to server
+        // Send goal to server (フィールド座標系)
         socket.emit('setGoal', { x, y });
     } else {
-        // Start drag for init pose
-        dragStart = { x, y };
-        dragEnd = { x, y };
+        // Start drag for init pose (画面座標で保存、後でフィールド座標に変換)
+        dragStart = { x: screenX, y: screenY, fieldX: x, fieldY: y };
+        dragEnd = { x: screenX, y: screenY };
     }
 });
 
@@ -405,10 +498,10 @@ canvas.addEventListener('mouseup', e => {
         
         let theta = (dist(dragStart, {x: ex, y: ey}) < 10) ? 0 : Math.atan2(ey - dragStart.y, ex - dragStart.x);
         
-        // Send init pose to server
+        // Send init pose to server (フィールド座標系)
         socket.emit('setInitPose', { 
-            x: dragStart.x, 
-            y: dragStart.y, 
+            x: dragStart.fieldX, 
+            y: dragStart.fieldY, 
             theta: theta 
         });
         

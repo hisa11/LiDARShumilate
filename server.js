@@ -50,14 +50,21 @@ async function loadDefaultMap() {
         let width = metadata.width;
         let height = metadata.height;
         
-        // キャンバスサイズに合わせてスケーリング
-        const canvasWidth = 1200;
-        const canvasHeight = 800;
+        // 画像サイズからスケールを計算: 1000px = 10m
+        // 例: 1000x1000 → 10m x 10m
+        const fieldWidthM = width / 100;  // 100 px/m
+        const fieldHeightM = height / 100;
         
-        // アスペクト比を維持してリサイズ
-        const scale = Math.min(canvasWidth / width, canvasHeight / height);
-        width = Math.floor(width * scale);
-        height = Math.floor(height * scale);
+        console.log(`📐 Map scale: ${width}x${height} px = ${fieldWidthM.toFixed(1)}m x ${fieldHeightM.toFixed(1)}m`);
+        
+        // 大きすぎる画像は縮小（パフォーマンス対策）
+        const maxSize = 1200;
+        if (width > maxSize || height > maxSize) {
+            const scale = maxSize / Math.max(width, height);
+            width = Math.floor(width * scale);
+            height = Math.floor(height * scale);
+            console.log(`📐 Resized to: ${width}x${height} px`);
+        }
         
         // グレースケールに変換してrawデータを取得
         const { data } = await image
@@ -77,7 +84,9 @@ async function loadDefaultMap() {
         return {
             width,
             height,
-            data: grayscaleData
+            data: grayscaleData,
+            fieldWidthM,
+            fieldHeightM
         };
     } catch (error) {
         console.error('❌ Error loading default map:', error);
@@ -187,16 +196,22 @@ app.post('/upload-map', upload.single('mapImage'), async (req, res) => {
 const workers = new Map();
 
 function createWorkerForClient(socketId, mapData) {
+    // キャンバスサイズはマップサイズに合わせる
+    const canvasWidth = mapData ? mapData.width : 1000;
+    const canvasHeight = mapData ? mapData.height : 1000;
+    
     const worker = new Worker('./simulation-worker.js', {
         workerData: {
             socketId,
             mapData: mapData ? {
                 width: mapData.width,
                 height: mapData.height,
-                data: Array.from(mapData.data)
+                data: Array.from(mapData.data),
+                fieldWidthM: mapData.fieldWidthM || (mapData.width / 100),
+                fieldHeightM: mapData.fieldHeightM || (mapData.height / 100)
             } : null,
-            canvasWidth: 1200,
-            canvasHeight: 800
+            canvasWidth,
+            canvasHeight
         }
     });
     

@@ -1,49 +1,54 @@
 {
   "robot": {
-    "radiusM": 0.15,
-    "widthM": 0.30,
-    "lengthM": 0.30,
+    "radiusM": 0.25,
+    "widthM": 0.5,
+    "lengthM": 0.5,
+    "shape": "square",
     "wheelType": "4-omni",
     "wheelDiameterM": 0.058,
-    "wheelBaseM": 0.20,
-    "description": "4輪オムニホイールロボット"
+    "wheelBaseM": 0.40,
+    "description": "500mm×500mm 正方形4輪オムニホイールロボット"
   },
   "lidar": {
     "offsetX_M": 0.10,
     "offsetY_M": 0.00,
     "offsetTheta_Rad": 0.0,
-    "numRays": 450,
+    "numRays": 180,
     "maxRangeM": 12.0,
     "minRangeM": 0.02,
     "scanFrequencyHz": 10,
     "description": "LiDARは左前輪と右後輪の延長線上に配置"
   },
   "kinematics": {
-    "maxSpeedMps": 1.0,
-    "maxAccelerationMps2": 2.0,
-    "maxRotationRadps": 2.0,
-    "maxRotationAccelRadps2": 4.0
+    "maxSpeedMps": 3.0,
+    "maxAccelerationMps2": 5.0,
+    "maxRotationRadps": 6.0,
+    "maxRotationAccelRadps2": 10.0
   },
   "safety": {
-    "wallMarginM": 0.30,
-    "minPassageWidthM": 0.45,
-    "emergencyStopDistM": 0.15
+    "wallMarginM": 0.10,
+    "minPassageWidthM": 0.55,
+    "emergencyStopDistM": 0.10
   },
   "localization": {
-    "particleCount": 300,
-    "particleLidarRays": 36,
-    "initialPoseUncertaintyM": 0.15,
-    "initialPoseUncertaintyRad": 0.1,
-    "motionNoiseXY": 0.03,
-    "motionNoiseTheta": 0.02,
-    "sensorNoisePx": 0.8
+    "particleCount": 50,
+    "particleLidarRays": 18,
+    "initialPoseUncertaintyM": 0.10,
+    "initialPoseUncertaintyRad": 0.05,
+    "motionNoiseXY": 0.02,
+    "motionNoiseTheta": 0.01,
+    "sensorNoisePx": 0.5
   },
   "control": {
-    "lookAheadDistM": 0.4,
-    "goalToleranceM": 0.05,
-    "angleToleranceRad": 0.1,
-    "linearPGain": 2.0,
-    "angularPGain": 3.0
+    "lookAheadDistM": 0.5,
+    "goalToleranceM": 0.08,
+    "angleToleranceRad": 0.15,
+    "linearPGain": 5.0,
+    "angularPGain": 6.0
+  },
+  "mapScale": {
+    "pixelsPerMeter": 100,
+    "description": "1000x1000画像 = 10m x 10m フィールド"
   },
   "communication": {
     "inputFormat": {

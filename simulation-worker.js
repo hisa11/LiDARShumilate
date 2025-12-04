@@ -1,11 +1,13 @@
 /**
- * Simulation Worker Thread
+ * Simulation Worker Thread - Lightweight Version
  * 
  * 各クライアント接続に対して専用のWorkerスレッドで
  * シミュレーション処理を実行する
+ * 
+ * 最適化: 10Hz更新、軽量パーティクルフィルタ
  */
 const { parentPort, workerData } = require('worker_threads');
-const { SimulationEngine, METERS_TO_PIXELS, ROBOT_CONF } = require('./simulation-engine');
+const { SimulationEngine, METERS_TO_PIXELS, ROBOT_CONF, setScale } = require('./simulation-engine');
 
 // Worker初期化データ
 const { socketId, mapData, canvasWidth, canvasHeight } = workerData;
@@ -18,6 +20,11 @@ if (mapData) {
         height: mapData.height,
         data: new Uint8Array(mapData.data)
     };
+    
+    // スケール設定: 画像サイズからメートル換算
+    const fieldWidthM = mapData.fieldWidthM || (mapData.width / 100);
+    const fieldHeightM = mapData.fieldHeightM || (mapData.height / 100);
+    setScale(mapData.width, mapData.height, fieldWidthM, fieldHeightM);
 }
 
 // シミュレーションエンジン初期化
@@ -58,17 +65,17 @@ function sendState() {
 
 // シミュレーションループ開始
 function startSimulationLoop() {
-    // 20Hz (50ms間隔) でシミュレーション更新
+    // 10Hz (100ms間隔) でシミュレーション更新 - 軽量化
     updateIntervalId = setInterval(() => {
         if (!isRunning) return;
         
         try {
-            sim.update(0.05); // 50ms = 0.05s
+            sim.update(0.1); // 100ms = 0.1s
             sendState();
         } catch (error) {
             log(`Update error: ${error.message}`);
         }
-    }, 50);
+    }, 100);
 }
 
 // メインスレッドからのメッセージを処理
