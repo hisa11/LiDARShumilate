@@ -1,18 +1,61 @@
 {
-  "radiusM": 0.15,
+  "robot": {
+    "radiusM": 0.15,
+    "widthM": 0.30,
+    "lengthM": 0.30,
+    "wheelType": "4-omni",
+    "wheelDiameterM": 0.058,
+    "wheelBaseM": 0.20,
+    "description": "4輪オムニホイールロボット"
+  },
   "lidar": {
     "offsetX_M": 0.10,
     "offsetY_M": 0.00,
+    "offsetTheta_Rad": 0.0,
     "numRays": 450,
     "maxRangeM": 12.0,
-    "minRangeM": 0.1
+    "minRangeM": 0.02,
+    "scanFrequencyHz": 10,
+    "description": "LiDARは左前輪と右後輪の延長線上に配置"
   },
   "kinematics": {
     "maxSpeedMps": 1.0,
-    "maxRotationRadps": 2.0
+    "maxAccelerationMps2": 2.0,
+    "maxRotationRadps": 2.0,
+    "maxRotationAccelRadps2": 4.0
   },
   "safety": {
     "wallMarginM": 0.30,
-    "minPassageWidthM": 0.45
+    "minPassageWidthM": 0.45,
+    "emergencyStopDistM": 0.15
+  },
+  "localization": {
+    "particleCount": 300,
+    "particleLidarRays": 36,
+    "initialPoseUncertaintyM": 0.15,
+    "initialPoseUncertaintyRad": 0.1,
+    "motionNoiseXY": 0.03,
+    "motionNoiseTheta": 0.02,
+    "sensorNoisePx": 0.8
+  },
+  "control": {
+    "lookAheadDistM": 0.4,
+    "goalToleranceM": 0.05,
+    "angleToleranceRad": 0.1,
+    "linearPGain": 2.0,
+    "angularPGain": 3.0
+  },
+  "communication": {
+    "inputFormat": {
+      "description": "マイコンから受信する情報",
+      "velocityX_mps": "ロボット前方向の速度 (m/s)",
+      "velocityY_mps": "ロボット左方向の速度 (m/s)"
+    },
+    "outputFormat": {
+      "description": "マイコンへ送信する指令値",
+      "commandVx_mps": "前方向指令速度 (m/s)",
+      "commandVy_mps": "左方向指令速度 (m/s)", 
+      "commandOmega_radps": "回転角速度指令 (rad/s)"
+    }
   }
 }

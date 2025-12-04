@@ -3,13 +3,13 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>LD19 LiDAR Global Planner Sim (Client)</title>
+    <title>LiDAR Robot Simulator - 4輪オムニホイール対応</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="/socket.io/socket.io.js"></script>
     <style>
         body { margin: 0; overflow: hidden; background-color: #121212; color: #e0e0e0; font-family: 'Segoe UI', sans-serif; }
         canvas { display: block; background-color: #1a1a1a; cursor: crosshair; }
-        #ui-layer { position: absolute; top: 10px; left: 10px; pointer-events: none; }
+        #ui-layer { position: absolute; top: 10px; left: 10px; pointer-events: none; max-height: calc(100vh - 20px); overflow-y: auto; }
         .panel { background: rgba(0, 0, 0, 0.9); padding: 15px; border-radius: 8px; pointer-events: auto; margin-bottom: 10px; border: 1px solid #444; max-width: 350px; box-shadow: 0 4px 6px rgba(0,0,0,0.5); }
         .panel.collapsed .panel-content { display: none; }
         .panel-header { display: flex; justify-content: space-between; align-items: center; cursor: pointer; user-select: none; }
@@ -37,6 +37,11 @@
         .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 5px; }
         .connected { background: #22c55e; }
         .disconnected { background: #ef4444; }
+        .command-display { background: #1a1a2e; padding: 10px; border-radius: 4px; font-family: 'Courier New', monospace; font-size: 0.85rem; margin-top: 10px; }
+        .command-row { display: flex; justify-content: space-between; margin-bottom: 3px; }
+        .command-label { color: #888; }
+        .command-value { color: #00ff00; }
+        .lidar-offset { background: #2a2a4e; padding: 8px; border-radius: 4px; margin-top: 10px; font-size: 0.8rem; }
     </style>
 </head>
 <body>
@@ -51,7 +56,7 @@
     <div id="ui-layer">
         <div class="panel" id="main-panel">
             <div class="panel-header" onclick="togglePanel('main-panel')">
-                <h1 style="margin: 0;">LD19 Global Planner <span class="specs-tag">A* Pathfinding</span></h1>
+                <h1 style="margin: 0;">4輪オムニ LiDAR Sim <span class="specs-tag">A* + AMCL</span></h1>
                 <span class="collapse-btn">▼</span>
             </div>
             
@@ -64,39 +69,75 @@
                 <span class="stat-label">AMCL Error</span>
                 <span class="stat-value" id="pos-error">0.00 m</span>
             </div>
-             <div class="stat-row">
-                <span class="stat-label">Odom Drift</span>
-                <span class="stat-value" id="odom-error" style="color: orange;">0.00 m</span>
-            </div>
             <div class="stat-row">
                 <span class="stat-label">Path Length</span>
                 <span class="stat-value" id="path-len">0 nodes</span>
             </div>
             
+            <!-- マイコン指令値表示 -->
+            <div class="command-display">
+                <div style="color: #eab308; margin-bottom: 5px; font-weight: bold;">📡 マイコン指令値 (m/s, rad/s)</div>
+                <div class="command-row">
+                    <span class="command-label">vx (前方):</span>
+                    <span class="command-value" id="cmd-vx">0.000</span>
+                </div>
+                <div class="command-row">
+                    <span class="command-label">vy (左方):</span>
+                    <span class="command-value" id="cmd-vy">0.000</span>
+                </div>
+                <div class="command-row">
+                    <span class="command-label">ω (回転):</span>
+                    <span class="command-value" id="cmd-omega">0.000</span>
+                </div>
+            </div>
+            
             <div style="margin-top: 15px; font-size: 0.8rem; border-top: 1px solid #444; padding-top: 10px;">
-                <div class="legend-item"><div class="dot" style="background:rgba(255, 0, 0, 0.3);"></div>Danger Zone (30cm)</div>
-                <div class="legend-item"><div class="dot" style="background:#00ff00;"></div>Computed Path</div>
                 <div class="legend-item"><div class="dot" style="background:#22c55e; border-radius:50%;"></div>Robot (Green)</div>
-                <div class="legend-item"><div class="dot" style="background:#00ffff; border-radius:50%;"></div>Estimate (Blue)</div>
+                <div class="legend-item"><div class="dot" style="background:#00ffff; border-radius:50%;"></div>Estimate (Cyan)</div>
                 <div class="legend-item"><div class="dot" style="background:#ff3300; border-radius:50%;"></div>LiDAR Points</div>
+                <div class="legend-item"><div class="dot" style="background:#00ff00;"></div>Planned Path</div>
+                <div class="legend-item"><div class="dot" style="background:rgba(255, 0, 0, 0.5);"></div>Particles</div>
             </div>
 
             <button id="btn-init-pose" onclick="toggleInitPoseMode()">📍 2D Pose Estimate</button>
             <button onclick="globalLocalization()" style="background: #059669;">🔍 Global Localization</button>
             <button onclick="resetSimulation()">Reset Simulation</button>
             <button class="secondary" onclick="kidnapRobot()">Kidnap (Random Position)</button>
-            <button class="secondary" onclick="toggleCostmap()">Toggle Costmap View</button>
             <button class="secondary" onclick="document.getElementById('mapUpload').click()">📁 Load Map Image</button>
             <input type="file" id="mapUpload" accept="image/*" style="display:none" onchange="handleMapUpload(event)">
             </div>
         </div>
-        <div class="panel" id="help-panel">
+        
+        <!-- ロボット設定パネル -->
+        <div class="panel collapsed" id="config-panel">
+            <div class="panel-header" onclick="togglePanel('config-panel')">
+                <h1 style="margin: 0; font-size: 1rem;">🔧 ロボット設定</h1>
+                <span class="collapse-btn">▼</span>
+            </div>
+            <div class="panel-content" style="font-size: 0.8rem;">
+                <div class="lidar-offset">
+                    <div style="color: #eab308; margin-bottom: 5px;">LiDAR位置オフセット</div>
+                    <div>X: <span id="lidar-offset-x">0.10</span> m (前方)</div>
+                    <div>Y: <span id="lidar-offset-y">0.00</span> m (左方)</div>
+                </div>
+                <div style="margin-top: 10px; color: #888;">
+                    <p>※ 設定は robot-config.json で編集</p>
+                    <p>4輪オムニホイール対応</p>
+                    <p>LiDAR: 左前輪-右後輪延長線上</p>
+                </div>
+            </div>
+        </div>
+        
+        <div class="panel collapsed" id="help-panel">
             <div class="panel-header" onclick="togglePanel('help-panel')">
-                <h1 style="margin: 0; font-size: 1rem;">ヘルプ</h1>
+                <h1 style="margin: 0; font-size: 1rem;">❓ ヘルプ</h1>
                 <span class="collapse-btn">▼</span>
             </div>
             <div class="panel-content" style="font-size: 0.8rem; color: #aaa;">
-                <p id="help-text">Click map to Plan Path. <br>Red zone = Wall + 30cm.<br>Path avoids narrow gaps (< 45cm) & centers in wide ones.</p>
+                <p><strong>クリック:</strong> 目標地点設定</p>
+                <p><strong>2D Pose Estimate:</strong> ドラッグで初期位置と向きを設定</p>
+                <p><strong>Global Localization:</strong> 位置不明時にパーティクルを全体に散布</p>
+                <p><strong>Kidnap:</strong> ロボットをランダム位置に移動（テスト用）</p>
             </div>
         </div>
     </div>
@@ -119,13 +160,15 @@ canvas.height = window.innerHeight;
 let gameState = null;
 let interactionMode = 'GOAL'; // 'GOAL' or 'INIT_POSE'
 let dragStart = null, dragEnd = null;
-let showCostmap = false;
 
 // Connection status
 socket.on('connect', () => {
     console.log('Connected to server');
     document.getElementById('status-dot').className = 'status-dot connected';
     document.getElementById('connection-text').textContent = '接続済み';
+    
+    // ロボット設定を読み込み
+    loadRobotConfig();
 });
 
 socket.on('disconnect', () => {
@@ -134,18 +177,99 @@ socket.on('disconnect', () => {
     document.getElementById('connection-text').textContent = '切断';
 });
 
+// ロボット設定を読み込み
+async function loadRobotConfig() {
+    try {
+        const response = await fetch('/api/config');
+        if (response.ok) {
+            const config = await response.json();
+            if (config.lidar) {
+                document.getElementById('lidar-offset-x').textContent = (config.lidar.offsetX_M || 0).toFixed(2);
+                document.getElementById('lidar-offset-y').textContent = (config.lidar.offsetY_M || 0).toFixed(2);
+            }
+        }
+    } catch (error) {
+        console.error('Failed to load robot config:', error);
+    }
+}
+
 // 初期化
 socket.on('init', (state) => {
     console.log('Received initial state', state);
     gameState = state;
+    
+    // 初期位置情報を表示
+    if (state.initialPose) {
+        const ip = state.initialPose;
+        console.log(`🤖 Initial pose: x=${ip.x_m.toFixed(2)}m, y=${ip.y_m.toFixed(2)}m, θ=${ip.theta_deg.toFixed(1)}°`);
+        
+        // 初期位置通知を表示
+        showInitialPoseNotification(ip);
+    }
+    
     draw();
     updateUI();
 });
 
+/**
+ * 初期位置通知を画面に表示
+ */
+function showInitialPoseNotification(pose) {
+    const notification = document.createElement('div');
+    notification.style.cssText = `
+        position: fixed;
+        top: 60px;
+        right: 10px;
+        background: rgba(34, 197, 94, 0.95);
+        color: white;
+        padding: 15px 20px;
+        border-radius: 8px;
+        font-family: 'Segoe UI', sans-serif;
+        font-size: 14px;
+        z-index: 1000;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        animation: slideIn 0.3s ease-out;
+    `;
+    notification.innerHTML = `
+        <div style="font-weight: bold; margin-bottom: 8px;">🤖 初期位置が自動設定されました</div>
+        <div style="font-family: 'Courier New', monospace;">
+            <div>X: ${pose.x_m.toFixed(2)} m</div>
+            <div>Y: ${pose.y_m.toFixed(2)} m</div>
+            <div>θ: ${pose.theta_deg.toFixed(1)}°</div>
+        </div>
+        <div style="margin-top: 10px; font-size: 12px; opacity: 0.9;">
+            ※ 2D Pose Estimateで再設定可能
+        </div>
+    `;
+    document.body.appendChild(notification);
+    
+    // アニメーションCSS追加
+    if (!document.getElementById('notification-style')) {
+        const style = document.createElement('style');
+        style.id = 'notification-style';
+        style.textContent = `
+            @keyframes slideIn {
+                from { transform: translateX(100%); opacity: 0; }
+                to { transform: translateX(0); opacity: 1; }
+            }
+            @keyframes fadeOut {
+                from { opacity: 1; }
+                to { opacity: 0; }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+    
+    // 5秒後にフェードアウトして削除
+    setTimeout(() => {
+        notification.style.animation = 'fadeOut 0.5s ease-out forwards';
+        setTimeout(() => notification.remove(), 500);
+    }, 5000);
+}
+
 // 状態更新
 socket.on('state', (state) => {
     gameState = state;
-    draw();
     updateUI();
 });
 
@@ -163,14 +287,18 @@ socket.on('goalResult', (result) => {
 socket.on('mapLoadResult', (result) => {
     if (result.success) {
         console.log('Map loaded successfully');
-        // 強制的に再描画
-        if (gameState) {
-            draw();
-            updateUI();
-        }
     } else {
         console.log('Map loading failed:', result.message);
         alert('マップの読み込みに失敗しました: ' + result.message);
+    }
+});
+
+// グローバルローカライゼーション結果
+socket.on('globalLocalizationResult', (result) => {
+    if (result.success) {
+        console.log('Global localization complete. Error:', result.error.toFixed(3), 'm');
+    } else {
+        console.log('Global localization failed');
     }
 });
 
@@ -196,14 +324,7 @@ function draw() {
     }
     ctx.stroke();
     
-    // 3. Danger Zone (Optional visualization)
-    if (showCostmap && gameState.costmap) {
-        ctx.fillStyle = 'rgba(255, 0, 0, 0.15)';
-        // Simple visualization - just show it's available
-        // Full costmap rendering would require distance map data
-    }
-    
-    // 4. Walls
+    // 3. Walls
     ctx.strokeStyle = '#888';
     ctx.lineWidth = 3;
     ctx.beginPath();
@@ -213,7 +334,7 @@ function draw() {
     }
     ctx.stroke();
     
-    // 5. Path
+    // 4. Path
     if (gameState.path && gameState.path.length > 0) {
         ctx.strokeStyle = '#00ff00';
         ctx.lineWidth = 3;
@@ -223,31 +344,50 @@ function draw() {
             ctx.lineTo(p.x, p.y);
         }
         ctx.stroke();
+        
+        // ゴール地点のマーカー
+        const goal = gameState.path[gameState.path.length - 1];
+        ctx.fillStyle = '#ff0000';
+        ctx.beginPath();
+        ctx.arc(goal.x, goal.y, 8, 0, Math.PI * 2);
+        ctx.fill();
     }
     
-    // 6. Particles
+    // 5. Particles
     ctx.fillStyle = 'rgba(255, 0, 0, 0.5)';
     for(let p of gameState.particles) {
         ctx.fillRect(p.x - 1, p.y - 1, 2, 2);
     }
     
-    // 7. Robot (True position)
+    // 6. Robot (True position)
     const pos = gameState.robot.pose;
     ctx.save();
     ctx.translate(pos.x, pos.y);
     ctx.rotate(pos.theta);
+    
+    // ロボット本体
     ctx.fillStyle = '#22c55e';
     ctx.beginPath();
     ctx.arc(0, 0, gameState.robot.radius, 0, Math.PI * 2);
     ctx.fill();
+    
+    // 方向マーカー
     ctx.strokeStyle = '#000';
+    ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.moveTo(0, 0);
     ctx.lineTo(gameState.robot.radius, 0);
     ctx.stroke();
+    
+    // LiDAR位置表示（小さな点）
+    ctx.fillStyle = '#ff0000';
+    ctx.beginPath();
+    ctx.arc(4, 0, 3, 0, Math.PI * 2); // offsetX_M * METERS_TO_PIXELS ≈ 4
+    ctx.fill();
+    
     ctx.restore();
     
-    // 8. Estimate
+    // 7. Estimate
     const est = gameState.estimate;
     ctx.save();
     ctx.translate(est.x, est.y);
@@ -263,9 +403,11 @@ function draw() {
     ctx.stroke();
     ctx.restore();
     
-    // 9. LiDAR scan
+    // 8. LiDAR scan (from TRUE robot position - not estimate)
+    // 注意: スキャンデータはロボットの真の位置から取得されたもの
     const scan = gameState.scan;
-    const startAng = est.theta;
+    const truePos = gameState.robot.pose;
+    const startAng = truePos.theta;
     const angStep = (Math.PI * 2) / scan.length;
     ctx.fillStyle = '#ff3300';
     for(let i = 0; i < scan.length; i++) {
@@ -273,18 +415,28 @@ function draw() {
         const maxRange = 12.0 * METERS_TO_PIXELS;
         if(dist > maxRange * 0.95) continue;
         const a = startAng + i * angStep;
-        const px = est.x + Math.cos(a) * dist;
-        const py = est.y + Math.sin(a) * dist;
+        const px = truePos.x + Math.cos(a) * dist;
+        const py = truePos.y + Math.sin(a) * dist;
         ctx.fillRect(px - 1, py - 1, 2, 2);
     }
     
-    // 10. Drag for init pose
+    // 9. Drag for init pose
     if(interactionMode === 'INIT_POSE' && dragStart && dragEnd) {
         ctx.strokeStyle = '#eab308';
         ctx.lineWidth = 2;
         ctx.beginPath();
         ctx.moveTo(dragStart.x, dragStart.y);
         ctx.lineTo(dragEnd.x, dragEnd.y);
+        ctx.stroke();
+        
+        // 矢印の先端
+        const angle = Math.atan2(dragEnd.y - dragStart.y, dragEnd.x - dragStart.x);
+        const arrowLen = 15;
+        ctx.beginPath();
+        ctx.moveTo(dragEnd.x, dragEnd.y);
+        ctx.lineTo(dragEnd.x - arrowLen * Math.cos(angle - 0.4), dragEnd.y - arrowLen * Math.sin(angle - 0.4));
+        ctx.moveTo(dragEnd.x, dragEnd.y);
+        ctx.lineTo(dragEnd.x - arrowLen * Math.cos(angle + 0.4), dragEnd.y - arrowLen * Math.sin(angle + 0.4));
         ctx.stroke();
     }
 }
@@ -293,8 +445,14 @@ function updateUI() {
     if (!gameState) return;
     
     document.getElementById('pos-error').innerText = gameState.stats.posError.toFixed(3) + " m";
-    document.getElementById('odom-error').innerText = gameState.stats.odomError.toFixed(3) + " m";
     document.getElementById('path-len').innerText = gameState.stats.pathLength > 0 ? gameState.stats.pathLength + " pts" : "None";
+    
+    // マイコン指令値を更新
+    if (gameState.command) {
+        document.getElementById('cmd-vx').innerText = gameState.command.vx.toFixed(3);
+        document.getElementById('cmd-vy').innerText = gameState.command.vy.toFixed(3);
+        document.getElementById('cmd-omega').innerText = gameState.command.omega.toFixed(3);
+    }
     
     let st = interactionMode === 'INIT_POSE' ? "SET POSE" : gameState.stats.status;
     document.getElementById('status-text').innerText = st;
@@ -321,19 +479,6 @@ function kidnapRobot() {
 function globalLocalization() {
     console.log('Performing global localization...');
     socket.emit('globalLocalization');
-}
-
-// グローバルローカライゼーション結果
-socket.on('globalLocalizationResult', (result) => {
-    if (result.success) {
-        console.log('Global localization complete. Error:', result.error.toFixed(3), 'm');
-    } else {
-        console.log('Global localization failed');
-    }
-});
-
-function toggleCostmap() {
-    showCostmap = !showCostmap;
 }
 
 // パネルの折りたたみ
