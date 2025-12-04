@@ -1,0 +1,18 @@
+{
+  "radiusM": 0.15,
+  "lidar": {
+    "offsetX_M": 0.10,
+    "offsetY_M": 0.00,
+    "numRays": 450,
+    "maxRangeM": 12.0,
+    "minRangeM": 0.1
+  },
+  "kinematics": {
+    "maxSpeedMps": 1.0,
+    "maxRotationRadps": 2.0
+  },
+  "safety": {
+    "wallMarginM": 0.30,
+    "minPassageWidthM": 0.45
+  }
+}
