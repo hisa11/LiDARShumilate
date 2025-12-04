@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LD19 LiDAR Global Planner Sim (Client)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="/socket.io/socket.io.js"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #121212; color: #e0e0e0; font-family: 'Segoe UI', sans-serif; }
+        canvas { display: block; background-color: #1a1a1a; cursor: crosshair; }
+        #ui-layer { position: absolute; top: 10px; left: 10px; pointer-events: none; }
+        .panel { background: rgba(0, 0, 0, 0.9); padding: 15px; border-radius: 8px; pointer-events: auto; margin-bottom: 10px; border: 1px solid #444; max-width: 350px; box-shadow: 0 4px 6px rgba(0,0,0,0.5); }
+        .panel.collapsed .panel-content { display: none; }
+        .panel-header { display: flex; justify-content: space-between; align-items: center; cursor: pointer; user-select: none; }
+        .panel-header:hover { opacity: 0.8; }
+        .collapse-btn { font-size: 1.2rem; transition: transform 0.3s; }
+        .panel.collapsed .collapse-btn { transform: rotate(-90deg); }
+        .panel-content { margin-top: 10px; }
+        .stat-row { display: flex; justify-content: space-between; margin-bottom: 5px; font-size: 0.9rem; align-items: center; }
+        .stat-label { color: #aaa; font-size: 0.85rem; }
+        .stat-value { font-family: 'Courier New', monospace; color: #fff; font-weight: bold; }
+        button {
+            background: #2563eb; color: white; border: none; padding: 8px 12px; border-radius: 4px; cursor: pointer; width: 100%; margin-top: 5px; font-weight: bold; transition: background 0.2s;
+            font-size: 0.9rem;
+        }
+        button:hover { background: #1d4ed8; }
+        button.secondary { background: #4b5563; margin-top: 5px; }
+        button.secondary:hover { background: #374151; }
+        button.active { background: #eab308; color: black; }
+        button.active:hover { background: #ca8a04; }
+        h1 { margin: 0 0 10px 0; font-size: 1.1rem; border-bottom: 1px solid #555; padding-bottom: 5px; color: #fff; }
+        .legend-item { display: flex; align-items: center; margin-bottom: 4px; font-size: 0.8rem; }
+        .dot { width: 12px; height: 12px; border-radius: 2px; margin-right: 8px; display: inline-block;}
+        .specs-tag { background: #333; padding: 2px 6px; border-radius: 4px; font-size: 0.7rem; color: #00ff00; margin-left: 5px; }
+        .connection-status { position: absolute; top: 10px; right: 10px; background: rgba(0,0,0,0.9); padding: 8px 12px; border-radius: 4px; font-size: 0.8rem; border: 1px solid #444; }
+        .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 5px; }
+        .connected { background: #22c55e; }
+        .disconnected { background: #ef4444; }
+    </style>
+</head>
+<body>
+
+    <canvas id="simCanvas"></canvas>
+
+    <div class="connection-status">
+        <span class="status-dot disconnected" id="status-dot"></span>
+        <span id="connection-text">接続中...</span>
+    </div>
+
+    <div id="ui-layer">
+        <div class="panel" id="main-panel">
+            <div class="panel-header" onclick="togglePanel('main-panel')">
+                <h1 style="margin: 0;">LD19 Global Planner <span class="specs-tag">A* Pathfinding</span></h1>
+                <span class="collapse-btn">▼</span>
+            </div>
+            
+            <div class="panel-content">
+            <div class="stat-row">
+                <span class="stat-label">Status</span>
+                <span class="stat-value" id="status-text" style="color:#00ff00;">IDLE</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">AMCL Error</span>
+                <span class="stat-value" id="pos-error">0.00 m</span>
+            </div>
+             <div class="stat-row">
+                <span class="stat-label">Odom Drift</span>
+                <span class="stat-value" id="odom-error" style="color: orange;">0.00 m</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">Path Length</span>
+                <span class="stat-value" id="path-len">0 nodes</span>
+            </div>
+            
+            <div style="margin-top: 15px; font-size: 0.8rem; border-top: 1px solid #444; padding-top: 10px;">
+                <div class="legend-item"><div class="dot" style="background:rgba(255, 0, 0, 0.3);"></div>Danger Zone (30cm)</div>
+                <div class="legend-item"><div class="dot" style="background:#00ff00;"></div>Computed Path</div>
+                <div class="legend-item"><div class="dot" style="background:#22c55e; border-radius:50%;"></div>Robot (Green)</div>
+                <div class="legend-item"><div class="dot" style="background:#00ffff; border-radius:50%;"></div>Estimate (Blue)</div>
+                <div class="legend-item"><div class="dot" style="background:#ff3300; border-radius:50%;"></div>LiDAR Points</div>
+            </div>
+
+            <button id="btn-init-pose" onclick="toggleInitPoseMode()">📍 2D Pose Estimate</button>
+            <button onclick="resetSimulation()">Reset Simulation</button>
+            <button class="secondary" onclick="kidnapRobot()">Kidnap (Global Loc)</button>
+            <button class="secondary" onclick="toggleCostmap()">Toggle Costmap View</button>
+            <button class="secondary" onclick="document.getElementById('mapUpload').click()">📁 Load Map Image</button>
+            <input type="file" id="mapUpload" accept="image/*" style="display:none" onchange="handleMapUpload(event)">
+            </div>
+        </div>
+        <div class="panel" id="help-panel">
+            <div class="panel-header" onclick="togglePanel('help-panel')">
+                <h1 style="margin: 0; font-size: 1rem;">ヘルプ</h1>
+                <span class="collapse-btn">▼</span>
+            </div>
+            <div class="panel-content" style="font-size: 0.8rem; color: #aaa;">
+                <p id="help-text">Click map to Plan Path. <br>Red zone = Wall + 30cm.<br>Path avoids narrow gaps (< 45cm) & centers in wide ones.</p>
+            </div>
+        </div>
+    </div>
+
+<script>
+const METERS_TO_PIXELS = 40; 
+const GRID_RES = 0.10; 
+const PIXELS_PER_GRID = GRID_RES * METERS_TO_PIXELS;
+
+// WebSocket接続
+const socket = io();
+
+// Canvas setup
+const canvas = document.getElementById('simCanvas');
+const ctx = canvas.getContext('2d');
+canvas.width = window.innerWidth;
+canvas.height = window.innerHeight;
+
+// State
+let gameState = null;
+let interactionMode = 'GOAL'; // 'GOAL' or 'INIT_POSE'
+let dragStart = null, dragEnd = null;
+let showCostmap = false;
+
+// Connection status
+socket.on('connect', () => {
+    console.log('Connected to server');
+    document.getElementById('status-dot').className = 'status-dot connected';
+    document.getElementById('connection-text').textContent = '接続済み';
+});
+
+socket.on('disconnect', () => {
+    console.log('Disconnected from server');
+    document.getElementById('status-dot').className = 'status-dot disconnected';
+    document.getElementById('connection-text').textContent = '切断';
+});
+
+// 初期化
+socket.on('init', (state) => {
+    console.log('Received initial state', state);
+    gameState = state;
+    draw();
+    updateUI();
+});
+
+// 状態更新
+socket.on('state', (state) => {
+    gameState = state;
+    draw();
+    updateUI();
+});
+
+// Goal設定結果
+socket.on('goalResult', (result) => {
+    if (result.success) {
+        console.log('Path found:', result.pathLength, 'points');
+    } else {
+        console.log('Path planning failed:', result.message);
+        alert('経路が見つかりませんでした');
+    }
+});
+
+// マップロード結果
+socket.on('mapLoadResult', (result) => {
+    if (result.success) {
+        console.log('Map loaded successfully');
+        // 強制的に再描画
+        if (gameState) {
+            draw();
+            updateUI();
+        }
+    } else {
+        console.log('Map loading failed:', result.message);
+        alert('マップの読み込みに失敗しました: ' + result.message);
+    }
+});
+
+// 描画関数
+function draw() {
+    if (!gameState) return;
+    
+    // 1. Background
+    ctx.fillStyle = '#121212';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    
+    // 2. Grid
+    ctx.strokeStyle = '#222';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for(let x = 0; x < canvas.width; x += METERS_TO_PIXELS) {
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, canvas.height);
+    }
+    for(let y = 0; y < canvas.height; y += METERS_TO_PIXELS) {
+        ctx.moveTo(0, y);
+        ctx.lineTo(canvas.width, y);
+    }
+    ctx.stroke();
+    
+    // 3. Danger Zone (Optional visualization)
+    if (showCostmap && gameState.costmap) {
+        ctx.fillStyle = 'rgba(255, 0, 0, 0.15)';
+        // Simple visualization - just show it's available
+        // Full costmap rendering would require distance map data
+    }
+    
+    // 4. Walls
+    ctx.strokeStyle = '#888';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    for(let w of gameState.walls) {
+        ctx.moveTo(w.p1.x, w.p1.y);
+        ctx.lineTo(w.p2.x, w.p2.y);
+    }
+    ctx.stroke();
+    
+    // 5. Path
+    if (gameState.path && gameState.path.length > 0) {
+        ctx.strokeStyle = '#00ff00';
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(gameState.path[0].x, gameState.path[0].y);
+        for (let p of gameState.path) {
+            ctx.lineTo(p.x, p.y);
+        }
+        ctx.stroke();
+    }
+    
+    // 6. Particles
+    ctx.fillStyle = 'rgba(255, 0, 0, 0.5)';
+    for(let p of gameState.particles) {
+        ctx.fillRect(p.x - 1, p.y - 1, 2, 2);
+    }
+    
+    // 7. Robot (True position)
+    const pos = gameState.robot.pose;
+    ctx.save();
+    ctx.translate(pos.x, pos.y);
+    ctx.rotate(pos.theta);
+    ctx.fillStyle = '#22c55e';
+    ctx.beginPath();
+    ctx.arc(0, 0, gameState.robot.radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#000';
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(gameState.robot.radius, 0);
+    ctx.stroke();
+    ctx.restore();
+    
+    // 8. Estimate
+    const est = gameState.estimate;
+    ctx.save();
+    ctx.translate(est.x, est.y);
+    ctx.rotate(est.theta);
+    ctx.strokeStyle = 'cyan';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(0, 0, gameState.robot.radius + 5, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(gameState.robot.radius + 8, 0);
+    ctx.stroke();
+    ctx.restore();
+    
+    // 9. LiDAR scan
+    const scan = gameState.scan;
+    const startAng = est.theta;
+    const angStep = (Math.PI * 2) / scan.length;
+    ctx.fillStyle = '#ff3300';
+    for(let i = 0; i < scan.length; i++) {
+        const dist = scan[i];
+        const maxRange = 12.0 * METERS_TO_PIXELS;
+        if(dist > maxRange * 0.95) continue;
+        const a = startAng + i * angStep;
+        const px = est.x + Math.cos(a) * dist;
+        const py = est.y + Math.sin(a) * dist;
+        ctx.fillRect(px - 1, py - 1, 2, 2);
+    }
+    
+    // 10. Drag for init pose
+    if(interactionMode === 'INIT_POSE' && dragStart && dragEnd) {
+        ctx.strokeStyle = '#eab308';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(dragStart.x, dragStart.y);
+        ctx.lineTo(dragEnd.x, dragEnd.y);
+        ctx.stroke();
+    }
+}
+
+function updateUI() {
+    if (!gameState) return;
+    
+    document.getElementById('pos-error').innerText = gameState.stats.posError.toFixed(3) + " m";
+    document.getElementById('odom-error').innerText = gameState.stats.odomError.toFixed(3) + " m";
+    document.getElementById('path-len').innerText = gameState.stats.pathLength > 0 ? gameState.stats.pathLength + " pts" : "None";
+    
+    let st = interactionMode === 'INIT_POSE' ? "SET POSE" : gameState.stats.status;
+    document.getElementById('status-text').innerText = st;
+}
+
+function toggleInitPoseMode() {
+    const btn = document.getElementById('btn-init-pose');
+    interactionMode = (interactionMode === 'INIT_POSE') ? 'GOAL' : 'INIT_POSE';
+    if (interactionMode === 'INIT_POSE') {
+        btn.classList.add('active');
+    } else {
+        btn.classList.remove('active');
+    }
+}
+
+function resetSimulation() {
+    socket.emit('reset', { width: canvas.width, height: canvas.height });
+}
+
+function kidnapRobot() {
+    socket.emit('kidnap');
+}
+
+function toggleCostmap() {
+    showCostmap = !showCostmap;
+}
+
+// パネルの折りたたみ
+function togglePanel(panelId) {
+    const panel = document.getElementById(panelId);
+    if (panel) {
+        panel.classList.toggle('collapsed');
+    }
+}
+
+// 画像からマップを読み込む
+async function handleMapUpload(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    
+    console.log('Uploading map image...');
+    
+    const formData = new FormData();
+    formData.append('mapImage', file);
+    
+    try {
+        const response = await fetch('/upload-map', {
+            method: 'POST',
+            body: formData
+        });
+        
+        const result = await response.json();
+        
+        if (result.success) {
+            console.log('Image processed, loading into simulation...');
+            socket.emit('loadMapImage', result.imageData);
+        } else {
+            alert('画像の処理に失敗しました: ' + result.message);
+        }
+    } catch (error) {
+        console.error('Upload error:', error);
+        alert('アップロードエラー: ' + error.message);
+    }
+    
+    // ファイル入力をリセット
+    event.target.value = '';
+}
+
+// Math utility
+function normalizeAngle(angle) {
+    while (angle > Math.PI) angle -= 2 * Math.PI;
+    while (angle < -Math.PI) angle += 2 * Math.PI;
+    return angle;
+}
+
+function dist(p1, p2) {
+    return Math.hypot(p2.x - p1.x, p2.y - p1.y);
+}
+
+// Mouse events
+canvas.addEventListener('mousedown', e => {
+    const r = canvas.getBoundingClientRect();
+    const x = e.clientX - r.left;
+    const y = e.clientY - r.top;
+    
+    if(interactionMode === 'GOAL') {
+        // Send goal to server
+        socket.emit('setGoal', { x, y });
+    } else {
+        // Start drag for init pose
+        dragStart = { x, y };
+        dragEnd = { x, y };
+    }
+});
+
+canvas.addEventListener('mousemove', e => {
+    if(interactionMode === 'INIT_POSE' && dragStart) {
+        const r = canvas.getBoundingClientRect();
+        dragEnd = { x: e.clientX - r.left, y: e.clientY - r.top };
+        draw(); // Redraw to show drag line
+    }
+});
+
+canvas.addEventListener('mouseup', e => {
+    if(interactionMode === 'INIT_POSE' && dragStart) {
+        const r = canvas.getBoundingClientRect();
+        const ex = e.clientX - r.left;
+        const ey = e.clientY - r.top;
+        
+        let theta = (dist(dragStart, {x: ex, y: ey}) < 10) ? 0 : Math.atan2(ey - dragStart.y, ex - dragStart.x);
+        
+        // Send init pose to server
+        socket.emit('setInitPose', { 
+            x: dragStart.x, 
+            y: dragStart.y, 
+            theta: theta 
+        });
+        
+        dragStart = null;
+        dragEnd = null;
+        toggleInitPoseMode();
+    }
+});
+
+window.addEventListener('resize', () => {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+    resetSimulation();
+});
+
+// Animation loop for smooth rendering
+function animate() {
+    if (gameState) {
+        draw();
+    }
+    requestAnimationFrame(animate);
+}
+
+animate();
+</script>
+</body>
+</html>

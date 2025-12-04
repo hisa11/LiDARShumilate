@@ -1,0 +1,872 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LD19 LiDAR Global Planner Sim</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #121212; color: #e0e0e0; font-family: 'Segoe UI', sans-serif; }
+        canvas { display: block; background-color: #1a1a1a; cursor: crosshair; }
+        #ui-layer { position: absolute; top: 10px; left: 10px; pointer-events: none; }
+        .panel { background: rgba(0, 0, 0, 0.9); padding: 15px; border-radius: 8px; pointer-events: auto; margin-bottom: 10px; border: 1px solid #444; max-width: 350px; box-shadow: 0 4px 6px rgba(0,0,0,0.5); }
+        .stat-row { display: flex; justify-content: space-between; margin-bottom: 5px; font-size: 0.9rem; align-items: center; }
+        .stat-label { color: #aaa; font-size: 0.85rem; }
+        .stat-value { font-family: 'Courier New', monospace; color: #fff; font-weight: bold; }
+        button {
+            background: #2563eb; color: white; border: none; padding: 8px 12px; border-radius: 4px; cursor: pointer; width: 100%; margin-top: 5px; font-weight: bold; transition: background 0.2s;
+            font-size: 0.9rem;
+        }
+        button:hover { background: #1d4ed8; }
+        button.secondary { background: #4b5563; margin-top: 5px; }
+        button.secondary:hover { background: #374151; }
+        button.active { background: #eab308; color: black; }
+        button.active:hover { background: #ca8a04; }
+        h1 { margin: 0 0 10px 0; font-size: 1.1rem; border-bottom: 1px solid #555; padding-bottom: 5px; color: #fff; }
+        .legend-item { display: flex; align-items: center; margin-bottom: 4px; font-size: 0.8rem; }
+        .dot { width: 12px; height: 12px; border-radius: 2px; margin-right: 8px; display: inline-block;}
+        .specs-tag { background: #333; padding: 2px 6px; border-radius: 4px; font-size: 0.7rem; color: #00ff00; margin-left: 5px; }
+    </style>
+</head>
+<body>
+
+    <canvas id="simCanvas"></canvas>
+
+    <div id="ui-layer">
+        <div class="panel">
+            <h1>LD19 Global Planner <span class="specs-tag">A* Pathfinding</span></h1>
+            
+            <div class="stat-row">
+                <span class="stat-label">Status</span>
+                <span class="stat-value" id="status-text" style="color:#00ff00;">IDLE</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">AMCL Error</span>
+                <span class="stat-value" id="pos-error">0.00 m</span>
+            </div>
+             <div class="stat-row">
+                <span class="stat-label">Odom Drift</span>
+                <span class="stat-value" id="odom-error" style="color: orange;">0.00 m</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">Path Length</span>
+                <span class="stat-value" id="path-len">0 nodes</span>
+            </div>
+            
+            <div style="margin-top: 15px; font-size: 0.8rem; border-top: 1px solid #444; padding-top: 10px;">
+                <div class="legend-item"><div class="dot" style="background:rgba(255, 0, 0, 0.3);"></div>Danger Zone (30cm)</div>
+                <div class="legend-item"><div class="dot" style="background:#00ff00;"></div>Computed Path</div>
+                <div class="legend-item"><div class="dot" style="background:#22c55e; border-radius:50%;"></div>Robot (Green)</div>
+                <div class="legend-item"><div class="dot" style="background:#00ffff; border-radius:50%;"></div>Estimate (Blue)</div>
+                <div class="legend-item"><div class="dot" style="background:#ff3300; border-radius:50%;"></div>LiDAR Points</div>
+            </div>
+
+            <button id="btn-init-pose" onclick="toggleInitPoseMode()">📍 2D Pose Estimate</button>
+            <button onclick="resetSimulation()">Reset Simulation</button>
+            <button class="secondary" onclick="kidnapRobot()">Kidnap (Global Loc)</button>
+             <button class="secondary" onclick="toggleCostmap()">Toggle Costmap View</button>
+        </div>
+        <div class="panel" style="font-size: 0.8rem; color: #aaa;">
+            <p id="help-text">Click map to Plan Path. <br>Red zone = Wall + 30cm.<br>Path avoids narrow gaps (< 45cm) & centers in wide ones.</p>
+        </div>
+    </div>
+
+<script>
+/**
+ * LD19 LiDAR & GLOBAL PLANNER
+ * ---------------------------
+ * Scale: 1 meter = 40 pixels
+ * Robot Radius: 15cm (Diameter 30cm)
+ * * Rules:
+ * 1. Danger Zone: 30cm from wall (Visualized in Red)
+ * 2. Min Passage Width: 1.5x Robot Width = 45cm.
+ * -> Radius clearance required: 22.5cm.
+ * -> Any grid cell < 22.5cm from wall is LETHAL (Impassable).
+ * 3. Centering: If width > 2x (60cm), prefer center.
+ * -> Implemented via Cost Field: Cost decreases as distance from wall increases.
+ */
+
+const METERS_TO_PIXELS = 40; 
+// FIXED: Increased grid resolution (10cm) to reduce memory usage and avoid "Invalid array length"
+const GRID_RES = 0.10; 
+const PIXELS_PER_GRID = GRID_RES * METERS_TO_PIXELS; // 4px per grid
+
+const CONF = {
+    maxLidarRange: 12.0 * METERS_TO_PIXELS,
+    minLidarRange: 0.02 * METERS_TO_PIXELS,
+    lidarRays: 450, 
+    particleCount: 600, 
+    particleLidarRays: 45, 
+    dt: 0.05,
+    
+    // Robot Specs
+    robotRadiusM: 0.15, // 15cm
+    
+    // Navigation Safety Constraints
+    safetyDistM: 0.30, // 30cm (Coloring zone)
+    minClearanceM: 0.225, // 1.5x width rule: (0.30 * 1.5) / 2 = 0.225m clearance radius required
+    
+    noise: {
+        odom_dist: 0.05, 
+        odom_angle: 0.03, 
+        lidar: 0.020 * METERS_TO_PIXELS 
+    }
+};
+
+// --- Math Utilities ---
+const MathUtils = {
+    normalizeAngle: (angle) => {
+        while (angle > Math.PI) angle -= 2 * Math.PI;
+        while (angle < -Math.PI) angle += 2 * Math.PI;
+        return angle;
+    },
+    gaussianRandom: (mean, variance) => {
+        let u = 0, v = 0;
+        while(u === 0) u = Math.random();
+        while(v === 0) v = Math.random();
+        const num = Math.sqrt( -2.0 * Math.log( u ) ) * Math.cos( 2.0 * Math.PI * v );
+        return num * variance + mean;
+    },
+    dist: (p1, p2) => Math.hypot(p2.x - p1.x, p2.y - p1.y),
+    intersect: (x1, y1, x2, y2, x3, y3, x4, y4) => {
+        const den = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
+        if (den === 0) return null;
+        const t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / den;
+        const u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / den;
+        if (t >= 0 && t <= 1 && u >= 0 && u <= 1) {
+            return { x: x1 + t * (x2 - x1), y: y1 + t * (y2 - y1) };
+        }
+        return null;
+    }
+};
+
+// --- Costmap & Grid System ---
+class Costmap {
+    constructor(widthPx, heightPx, walls) {
+        this.widthPx = widthPx;
+        this.heightPx = heightPx;
+        this.cols = Math.ceil(widthPx / PIXELS_PER_GRID);
+        this.rows = Math.ceil(heightPx / PIXELS_PER_GRID);
+        
+        // 0: Free, 1: Wall, >0: Distance to nearest wall (in meters)
+        this.distMap = new Float32Array(this.cols * this.rows).fill(999.0);
+        this.isWall = new Uint8Array(this.cols * this.rows).fill(0);
+        
+        this.buildMap(walls);
+    }
+    
+    buildMap(walls) {
+        // 1. Rasterize Walls onto Grid
+        for (let w of walls) {
+            this.rasterizeLine(w.p1, w.p2);
+        }
+        
+        // 2. Compute Distance Transform (BFS / Brushfire)
+        // FIXED: Use Int32Array for queue to prevent "RangeError: Invalid array length" on large maps
+        const totalPixels = this.cols * this.rows;
+        const queue = new Int32Array(totalPixels);
+        let head = 0;
+        let tail = 0;
+        
+        // Init queue with wall pixels
+        for (let i = 0; i < totalPixels; i++) {
+            if (this.isWall[i]) {
+                this.distMap[i] = 0;
+                queue[tail++] = i;
+            }
+        }
+        
+        // BFS
+        const offsets = [-1, 1, -this.cols, this.cols]; 
+        
+        while(head < tail) {
+            let currIdx = queue[head++];
+            let cx = currIdx % this.cols;
+            let currentDist = this.distMap[currIdx];
+            
+            // Check neighbors
+            for(let offset of offsets) {
+                let neighborIdx = currIdx + offset;
+                
+                // Bounds check logic
+                let nx = neighborIdx % this.cols;
+                let ny = Math.floor(neighborIdx / this.cols);
+                
+                // Check wrap-around or out of bounds
+                if (nx < 0 || nx >= this.cols || ny < 0 || ny >= this.rows) continue;
+                if (Math.abs(nx - cx) > 1) continue; 
+                
+                if (this.distMap[neighborIdx] > currentDist + GRID_RES) {
+                    this.distMap[neighborIdx] = currentDist + GRID_RES;
+                    queue[tail++] = neighborIdx;
+                }
+            }
+        }
+    }
+    
+    rasterizeLine(p1, p2) {
+        // Bresenham-like stepping
+        let x0 = Math.floor(p1.x / PIXELS_PER_GRID);
+        let y0 = Math.floor(p1.y / PIXELS_PER_GRID);
+        let x1 = Math.floor(p2.x / PIXELS_PER_GRID);
+        let y1 = Math.floor(p2.y / PIXELS_PER_GRID);
+        
+        let dx = Math.abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+        let dy = -Math.abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+        let err = dx + dy;
+        
+        while (true) {
+            if (x0 >= 0 && x0 < this.cols && y0 >= 0 && y0 < this.rows) {
+                this.isWall[y0 * this.cols + x0] = 1;
+            }
+            if (x0 === x1 && y0 === y1) break;
+            let e2 = 2 * err;
+            if (e2 >= dy) { err += dy; x0 += sx; }
+            if (e2 <= dx) { err += dx; y0 += sy; }
+        }
+    }
+    
+    // Get cost for A* (0 to 255)
+    // High cost = close to wall. 255 = Lethal.
+    getCost(idx) {
+        const dist = this.distMap[idx];
+        
+        // Rule: If distance < 22.5cm, IMPASSABLE (Lethal)
+        if (dist < CONF.minClearanceM) return 255;
+        
+        const safeDist = 1.0; // Beyond 1m, cost is flat (0)
+        if (dist > safeDist) return 1; // Minimum movement cost
+        
+        // Scale 1 to 254 based on distance
+        const norm = (dist - CONF.minClearanceM) / (safeDist - CONF.minClearanceM); // 0.0 (danger) to 1.0 (safe)
+        const cost = Math.floor((1.0 - norm) * 50) + 1; // 1 to 51
+        
+        return cost;
+    }
+}
+
+// --- Global Planner (A*) ---
+class GlobalPlanner {
+    constructor(costmap) {
+        this.cm = costmap;
+    }
+    
+    plan(startPx, goalPx) {
+        const sx = Math.floor(startPx.x / PIXELS_PER_GRID);
+        const sy = Math.floor(startPx.y / PIXELS_PER_GRID);
+        const gx = Math.floor(goalPx.x / PIXELS_PER_GRID);
+        const gy = Math.floor(goalPx.y / PIXELS_PER_GRID);
+        
+        const startIdx = sy * this.cm.cols + sx;
+        const goalIdx = gy * this.cm.cols + gx;
+        
+        // Validation
+        if (sx < 0 || sx >= this.cm.cols || sy < 0 || sy >= this.cm.rows) return null;
+        if (gx < 0 || gx >= this.cm.cols || gy < 0 || gy >= this.cm.rows) return null;
+        if (this.cm.getCost(goalIdx) === 255) {
+            console.warn("Goal is in lethal obstacle/too close to wall");
+            return null;
+        }
+        
+        // A* Setup
+        const openSet = [startIdx];
+        const cameFrom = new Map();
+        const gScore = new Map();
+        const fScore = new Map();
+        
+        gScore.set(startIdx, 0);
+        fScore.set(startIdx, this.heuristic(sx, sy, gx, gy));
+        
+        const neighbors = [-1, 1, -this.cm.cols, this.cm.cols, 
+                          -this.cm.cols-1, -this.cm.cols+1, this.cm.cols-1, this.cm.cols+1]; // 8-way
+
+        while (openSet.length > 0) {
+            // Get node with lowest fScore
+            openSet.sort((a, b) => (fScore.get(a) || Infinity) - (fScore.get(b) || Infinity));
+            const current = openSet.shift();
+            
+            if (current === goalIdx) {
+                return this.reconstructPath(cameFrom, current);
+            }
+            
+            const cx = current % this.cm.cols;
+            const cy = Math.floor(current / this.cm.cols);
+            
+            for (let offset of neighbors) {
+                const neighbor = current + offset;
+                const nx = neighbor % this.cm.cols;
+                const ny = Math.floor(neighbor / this.cm.cols);
+                
+                // Bounds & Wrap check
+                if (nx < 0 || nx >= this.cm.cols || ny < 0 || ny >= this.cm.rows) continue;
+                if (Math.abs(nx - cx) > 1 || Math.abs(ny - cy) > 1) continue;
+                
+                const cellCost = this.cm.getCost(neighbor);
+                if (cellCost === 255) continue; // Obstacle
+                
+                // Dist cost: 1.0 for straight, 1.414 for diag
+                const distCost = (offset === -1 || offset === 1 || offset === -this.cm.cols || offset === this.cm.cols) ? 1.0 : 1.414;
+                
+                // Total G Score = Path Dist + Cell Penalty (to stay in center)
+                const tentative_gScore = gScore.get(current) + distCost + (cellCost * 0.5); 
+                
+                if (tentative_gScore < (gScore.get(neighbor) || Infinity)) {
+                    cameFrom.set(neighbor, current);
+                    gScore.set(neighbor, tentative_gScore);
+                    fScore.set(neighbor, tentative_gScore + this.heuristic(nx, ny, gx, gy));
+                    
+                    if (!openSet.includes(neighbor)) {
+                        openSet.push(neighbor);
+                    }
+                }
+            }
+        }
+        
+        console.log("No path found");
+        return null;
+    }
+    
+    heuristic(x1, y1, x2, y2) {
+        return Math.hypot(x2 - x1, y2 - y1);
+    }
+    
+    reconstructPath(cameFrom, current) {
+        const totalPath = [this.idxToPoint(current)];
+        while (cameFrom.has(current)) {
+            current = cameFrom.get(current);
+            totalPath.unshift(this.idxToPoint(current));
+        }
+        return totalPath;
+    }
+    
+    idxToPoint(idx) {
+        return {
+            x: (idx % this.cm.cols) * PIXELS_PER_GRID + (PIXELS_PER_GRID/2),
+            y: Math.floor(idx / this.cm.cols) * PIXELS_PER_GRID + (PIXELS_PER_GRID/2)
+        };
+    }
+}
+
+// --- World & Lidar (Same as before) ---
+class WorldMap {
+    constructor(width, height) {
+        this.width = width;
+        this.height = height;
+        this.walls = [];
+        this.createWalls();
+    }
+    createWalls() {
+        const w = this.width, h = this.height;
+        this.walls.push({p1: {x:0, y:0}, p2: {x:w, y:0}});
+        this.walls.push({p1: {x:w, y:0}, p2: {x:w, y:h}});
+        this.walls.push({p1: {x:w, y:h}, p2: {x:0, y:h}});
+        this.walls.push({p1: {x:0, y:h}, p2: {x:0, y:0}});
+        this.addRect(w*0.1, h*0.1, w*0.3, h*0.3);
+        this.walls.push({p1: {x:w*0.6, y:h*0.1}, p2: {x:w*0.6, y:h*0.4}});
+        this.walls.push({p1: {x:w*0.6, y:h*0.4}, p2: {x:w*0.9, y:h*0.4}});
+        this.addRect(w*0.45, h*0.45, w*0.1, h*0.1);
+        this.walls.push({p1: {x:w*0.2, y:h*0.7}, p2: {x:w*0.4, y:h*0.9}});
+        this.walls.push({p1: {x:w*0.7, y:h*0.6}, p2: {x:w*0.7, y:h*0.9}});
+        this.walls.push({p1: {x:w*0.75, y:h*0.6}, p2: {x:w*0.75, y:h*0.9}});
+    }
+    addRect(x, y, w, h) {
+        this.walls.push({p1:{x:x, y:y}, p2:{x:x+w, y:y}});
+        this.walls.push({p1:{x:x+w, y:y}, p2:{x:x+w, y:y+h}});
+        this.walls.push({p1:{x:x+w, y:y+h}, p2:{x:x, y:y+h}});
+        this.walls.push({p1:{x:x, y:y+h}, p2:{x:x, y:y}});
+    }
+}
+
+class Lidar {
+    constructor(numRays, maxRange) {
+        this.numRays = numRays;
+        this.maxRange = maxRange;
+        this.fov = Math.PI * 2;
+    }
+    scan(pose, walls, noiseStdDev = 0) {
+        const ranges = new Float32Array(this.numRays);
+        const startAngle = pose.theta;
+        const angleStep = this.fov / this.numRays;
+        const poseX = pose.x;
+        const poseY = pose.y;
+
+        for (let i = 0; i < this.numRays; i++) {
+            const angle = startAngle + i * angleStep;
+            const dirX = Math.cos(angle);
+            const dirY = Math.sin(angle);
+            const rayEndX = poseX + dirX * this.maxRange;
+            const rayEndY = poseY + dirY * this.maxRange;
+
+            let minDist = this.maxRange;
+            for (let j = 0, len = walls.length; j < len; j++) {
+                const w = walls[j];
+                const hit = MathUtils.intersect(w.p1.x, w.p1.y, w.p2.x, w.p2.y, poseX, poseY, rayEndX, rayEndY);
+                if (hit) {
+                    const d = Math.hypot(hit.x - poseX, hit.y - poseY);
+                    if (d < minDist) minDist = d;
+                }
+            }
+            if (noiseStdDev > 0 && minDist < this.maxRange) {
+                minDist += MathUtils.gaussianRandom(0, noiseStdDev);
+                if(minDist < CONF.minLidarRange) minDist = CONF.minLidarRange;
+            }
+            ranges[i] = minDist;
+        }
+        return ranges;
+    }
+}
+
+// --- Robot & Particle Filter ---
+class Robot {
+    constructor(x, y, theta) {
+        this.pose = { x, y, theta }; 
+        this.odomPose = { x, y, theta };
+        this.radius = CONF.robotRadiusM * METERS_TO_PIXELS; 
+        this.lidar = new Lidar(CONF.lidarRays, CONF.maxLidarRange);
+        this.path = null;
+        this.pathIndex = 0;
+    }
+
+    move(v, w, dt, walls) {
+        // Simple kinematics
+        const trueNextTheta = MathUtils.normalizeAngle(this.pose.theta + w * dt);
+        const trueNextX = this.pose.x + v * Math.cos(this.pose.theta) * dt;
+        const trueNextY = this.pose.y + v * Math.sin(this.pose.theta) * dt;
+
+        let collision = false;
+        if (trueNextX < 0 || trueNextX > canvas.width || trueNextY < 0 || trueNextY > canvas.height) collision = true;
+        
+        if (!collision) {
+            this.pose.x = trueNextX;
+            this.pose.y = trueNextY;
+            this.pose.theta = trueNextTheta;
+        }
+
+        const noiseD = Math.abs(v * dt) * CONF.noise.odom_dist; 
+        const noiseA = Math.abs(w * dt) * CONF.noise.odom_angle;
+        const measDist = (v * dt) + MathUtils.gaussianRandom(0, noiseD);
+        const measRot = (w * dt) + MathUtils.gaussianRandom(0, noiseA);
+
+        this.odomPose.theta = MathUtils.normalizeAngle(this.odomPose.theta + measRot);
+        this.odomPose.x += measDist * Math.cos(this.odomPose.theta);
+        this.odomPose.y += measDist * Math.sin(this.odomPose.theta);
+
+        return { lin: measDist, ang: measRot };
+    }
+}
+
+class ParticleFilter {
+    constructor(count, mapWidth, mapHeight, knownMap) {
+        this.count = count;
+        this.width = mapWidth;
+        this.height = mapHeight;
+        this.map = knownMap;
+        this.simLidar = new Lidar(CONF.particleLidarRays, CONF.maxLidarRange);
+        this.particles = [];
+        this.initGlobal();
+    }
+    initGlobal() {
+        this.particles = [];
+        for (let i = 0; i < this.count; i++) {
+            this.particles.push({
+                x: Math.random() * this.width,
+                y: Math.random() * this.height,
+                theta: Math.random() * Math.PI * 2,
+                weight: 1.0 / this.count
+            });
+        }
+    }
+    setEstimatedPose(x, y, theta) {
+        this.particles = [];
+        const xyStdDev = 0.5 * METERS_TO_PIXELS; 
+        const thetaStdDev = 0.1;
+        for (let i = 0; i < this.count; i++) {
+            this.particles.push({
+                x: x + MathUtils.gaussianRandom(0, xyStdDev),
+                y: y + MathUtils.gaussianRandom(0, xyStdDev),
+                theta: MathUtils.normalizeAngle(theta + MathUtils.gaussianRandom(0, thetaStdDev)),
+                weight: 1.0 / this.count
+            });
+        }
+    }
+    predict(odomDelta) {
+        for (let p of this.particles) {
+            const dSig = Math.abs(odomDelta.lin) * 0.15; 
+            const aSig = Math.abs(odomDelta.ang) * 0.10;
+            const noisyDist = odomDelta.lin + MathUtils.gaussianRandom(0, dSig);
+            const noisyRot = odomDelta.ang + MathUtils.gaussianRandom(0, aSig);
+            p.theta = MathUtils.normalizeAngle(p.theta + noisyRot);
+            p.x += noisyDist * Math.cos(p.theta);
+            p.y += noisyDist * Math.sin(p.theta);
+        }
+    }
+    update(realScan) {
+        let maxWeight = 0;
+        const stepRatio = Math.floor(realScan.length / CONF.particleLidarRays);
+        const sigma2 = 50.0; 
+        for (let p of this.particles) {
+            if (p.x < 0 || p.x > this.width || p.y < 0 || p.y > this.height) {
+                p.weight = 0; continue;
+            }
+            const hypoScan = this.simLidar.scan(p, this.map, 0); 
+            let logLikelihood = 0;
+            let validPoints = 0;
+            for (let i = 0; i < hypoScan.length; i++) {
+                const realDist = realScan[i * stepRatio];
+                const hypoDist = hypoScan[i];
+                if (realDist >= CONF.maxLidarRange * 0.99 && hypoDist >= CONF.maxLidarRange * 0.99) continue;
+                const diff = realDist - hypoDist;
+                logLikelihood += -(diff * diff) / sigma2;
+                validPoints++;
+            }
+            if (validPoints > 0) p.weight = Math.exp(logLikelihood / validPoints);
+            else p.weight = 0.000001;
+            if (p.weight > maxWeight) maxWeight = p.weight;
+        }
+        let totalWeight = 0;
+        for (let p of this.particles) totalWeight += p.weight;
+        if (totalWeight > 0) { for (let p of this.particles) p.weight /= totalWeight; }
+        else this.initGlobal();
+    }
+    resample() {
+        const newParticles = [];
+        let index = Math.floor(Math.random() * this.count);
+        let beta = 0;
+        let maxWeight = 0;
+        for (let p of this.particles) if(p.weight > maxWeight) maxWeight = p.weight;
+        const randomCount = Math.floor(this.count * 0.01);
+        for (let i = 0; i < this.count - randomCount; i++) {
+            beta += Math.random() * 2 * maxWeight;
+            while (beta > this.particles[index].weight) {
+                beta -= this.particles[index].weight;
+                index = (index + 1) % this.count;
+            }
+            const p = this.particles[index];
+            newParticles.push({ x: p.x, y: p.y, theta: p.theta, weight: p.weight });
+        }
+        for(let i=0; i<randomCount; i++) {
+             newParticles.push({
+                x: Math.random() * this.width,
+                y: Math.random() * this.height,
+                theta: Math.random() * Math.PI * 2,
+                weight: 0 
+            });
+        }
+        this.particles = newParticles;
+    }
+    getEstimate() {
+        let x = 0, y = 0, sinSum = 0, cosSum = 0;
+        let totalW = 0;
+        for (let p of this.particles) {
+            x += p.x * p.weight;
+            y += p.y * p.weight;
+            sinSum += Math.sin(p.theta) * p.weight;
+            cosSum += Math.cos(p.theta) * p.weight;
+            totalW += p.weight;
+        }
+        if (totalW === 0) return this.particles[0];
+        return {
+            x: x / totalW,
+            y: y / totalW,
+            theta: Math.atan2(sinSum / totalW, cosSum / totalW)
+        };
+    }
+}
+
+// --- Main App ---
+const canvas = document.getElementById('simCanvas');
+const ctx = canvas.getContext('2d');
+let world, robot, particleFilter, costmap, planner;
+let lastTime = Date.now();
+let interactionMode = 'GOAL';
+let dragStart, dragEnd;
+let showCostmap = false;
+
+function init() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+    world = new WorldMap(canvas.width, canvas.height);
+    
+    // Initialize Costmap
+    costmap = new Costmap(canvas.width, canvas.height, world.walls);
+    planner = new GlobalPlanner(costmap);
+    
+    // Spawn robot
+    const startX = canvas.width * 0.2;
+    const startY = canvas.height * 0.5;
+    robot = new Robot(startX, startY, 0);
+    robot.odomPose = { x: startX, y: startY, theta: 0 };
+    
+    // Initialize Filter
+    particleFilter = new ParticleFilter(CONF.particleCount, canvas.width, canvas.height, world.walls);
+    particleFilter.setEstimatedPose(startX, startY, 0);
+}
+
+function resetSimulation() {
+    init();
+}
+
+function kidnapRobot() {
+    if(!robot) return;
+    robot.pose.x = Math.random() * canvas.width;
+    robot.pose.y = Math.random() * canvas.height;
+    robot.pose.theta = Math.random() * Math.PI * 2;
+}
+
+function toggleInitPoseMode() {
+    const btn = document.getElementById('btn-init-pose');
+    interactionMode = (interactionMode === 'INIT_POSE') ? 'GOAL' : 'INIT_POSE';
+    if (interactionMode === 'INIT_POSE') btn.classList.add('active');
+    else btn.classList.remove('active');
+}
+
+function toggleCostmap() {
+    showCostmap = !showCostmap;
+}
+
+// Path Follow Controller
+function computeControl() {
+    if (!robot || !robot.path || robot.path.length === 0) return { v: 0, w: 0 };
+    if (!particleFilter) return { v: 0, w: 0 };
+
+    const est = particleFilter.getEstimate();
+    
+    // Look ahead
+    let targetIdx = robot.pathIndex;
+    const lookAheadDist = 0.5 * METERS_TO_PIXELS; // 50cm lookahead
+    
+    // Find first point in path that is > lookAheadDist away from current pos
+    // But start searching from current index to allow progress
+    for (let i = robot.pathIndex; i < robot.path.length; i++) {
+        const d = MathUtils.dist(est, robot.path[i]);
+        if (d > lookAheadDist) {
+            targetIdx = i;
+            break;
+        }
+        // If we are close to the end, target the end
+        if (i === robot.path.length - 1) targetIdx = i;
+    }
+    
+    // Update index (ratchet forward only)
+    robot.pathIndex = targetIdx;
+    
+    const target = robot.path[targetIdx];
+    const dx = target.x - est.x;
+    const dy = target.y - est.y;
+    const distToTarget = Math.hypot(dx, dy);
+    
+    // Reached End?
+    if (robot.pathIndex >= robot.path.length - 1 && distToTarget < 0.1 * METERS_TO_PIXELS) {
+        robot.path = null;
+        return { v: 0, w: 0 };
+    }
+
+    const targetAngle = Math.atan2(dy, dx);
+    const angleDiff = MathUtils.normalizeAngle(targetAngle - est.theta);
+    
+    let v = 2.0 * METERS_TO_PIXELS; 
+    let w = angleDiff * 4.0;
+    
+    // Slow down on turns
+    if (Math.abs(angleDiff) > 0.5) v = 0;
+    else v *= Math.max(0.2, 1.0 - Math.abs(angleDiff));
+
+    return { v, w };
+}
+
+function draw() {
+    if (!particleFilter || !robot) return; // Guard against uninitialized state
+
+    // 1. Draw Field
+    ctx.fillStyle = '#121212'; ctx.fillRect(0,0,canvas.width,canvas.height);
+    
+    // Optional: Draw Costmap Heatmap
+    if (showCostmap) {
+        const imageData = ctx.createImageData(costmap.cols, costmap.rows);
+        for(let i=0; i<costmap.distMap.length; i++) {
+            const cost = costmap.getCost(i);
+            const r = cost; 
+            const g = 255 - cost;
+            const b = 0;
+            const a = cost > 1 ? 100 : 0; // Only show non-free space
+            
+            const pxIdx = i * 4;
+            imageData.data[pxIdx] = r;
+            imageData.data[pxIdx+1] = g;
+            imageData.data[pxIdx+2] = b;
+            imageData.data[pxIdx+3] = a;
+        }
+        // This is slow (drawing per pixel on main canvas from small grid), so we stretch it
+        // A temporary canvas would be better, but for simplicity:
+        // We will just draw circles for Danger Zones in main loop instead of full heatmap
+    }
+
+    // Grid
+    ctx.strokeStyle = '#222'; ctx.lineWidth = 1; ctx.beginPath();
+    for(let x=0; x<canvas.width; x+=METERS_TO_PIXELS) { ctx.moveTo(x,0); ctx.lineTo(x,canvas.height); }
+    for(let y=0; y<canvas.height; y+=METERS_TO_PIXELS) { ctx.moveTo(0,y); ctx.lineTo(canvas.width,y); }
+    ctx.stroke();
+
+    // 2. Visualize Danger Zone (30cm)
+    // We iterate the costmap distMap sparsely to draw red zones
+    ctx.fillStyle = 'rgba(255, 0, 0, 0.2)';
+    const safetyPx = CONF.safetyDistM * METERS_TO_PIXELS;
+    
+    // Optimization: Don't iterate all pixels. Just draw where walls are?
+    // Actually, let's just draw the wall lines for simplicity, 
+    // and rely on the costmap debug view if needed.
+    // OR: Draw simple rects for grid cells that are dangerous
+    if (!showCostmap) {
+         ctx.fillStyle = 'rgba(255, 0, 0, 0.15)';
+         for(let y=0; y<costmap.rows; y+=2) { // Skip some for perf
+             for(let x=0; x<costmap.cols; x+=2) {
+                 const idx = y * costmap.cols + x;
+                 const distM = costmap.distMap[idx];
+                 if (distM < CONF.safetyDistM) {
+                     ctx.fillRect(x*PIXELS_PER_GRID, y*PIXELS_PER_GRID, PIXELS_PER_GRID*2, PIXELS_PER_GRID*2);
+                 }
+             }
+         }
+    }
+
+    // Walls
+    ctx.strokeStyle = '#888'; ctx.lineWidth = 3; ctx.beginPath();
+    for(let w of world.walls) { ctx.moveTo(w.p1.x, w.p1.y); ctx.lineTo(w.p2.x, w.p2.y); }
+    ctx.stroke();
+
+    // 3. Draw Path
+    if (robot.path) {
+        ctx.strokeStyle = '#00ff00'; ctx.lineWidth = 3;
+        ctx.beginPath();
+        if (robot.path.length > 0) ctx.moveTo(robot.path[0].x, robot.path[0].y);
+        for (let p of robot.path) ctx.lineTo(p.x, p.y);
+        ctx.stroke();
+    }
+
+    // 4. Particles
+    ctx.fillStyle = 'rgba(255, 0, 0, 0.5)';
+    for(let p of particleFilter.particles) {
+        ctx.fillRect(p.x-1, p.y-1, 2, 2);
+    }
+
+    // 5. Robot & Estimate
+    const est = particleFilter.getEstimate();
+    const pos = robot.pose;
+    
+    // True
+    ctx.save(); ctx.translate(pos.x, pos.y); ctx.rotate(pos.theta);
+    ctx.fillStyle = '#22c55e';
+    ctx.beginPath(); ctx.arc(0,0,robot.radius,0,Math.PI*2); ctx.fill();
+    ctx.strokeStyle='#000'; ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(robot.radius,0); ctx.stroke();
+    ctx.restore();
+
+    // Estimate
+    ctx.save(); ctx.translate(est.x, est.y); ctx.rotate(est.theta);
+    ctx.strokeStyle = 'cyan'; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.arc(0,0,robot.radius+5,0,Math.PI*2); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(robot.radius+8,0); ctx.stroke();
+    ctx.restore();
+    
+    // 6. LiDAR
+    const scan = robot.lidar.scan(robot.pose, world.walls, CONF.noise.lidar);
+    const startAng = est.theta;
+    const angStep = (Math.PI*2) / scan.length;
+    ctx.fillStyle = '#ff3300';
+    for(let i=0; i<scan.length; i++) {
+        const dist = scan[i];
+        if(dist > CONF.maxLidarRange*0.95) continue;
+        const a = startAng + i*angStep;
+        const px = est.x + Math.cos(a)*dist;
+        const py = est.y + Math.sin(a)*dist;
+        ctx.fillRect(px-1, py-1, 2, 2);
+    }
+    
+    // Drag
+    if(interactionMode === 'INIT_POSE' && dragStart && dragEnd) {
+        ctx.strokeStyle = '#eab308'; ctx.lineWidth=2;
+        ctx.beginPath(); ctx.moveTo(dragStart.x, dragStart.y); ctx.lineTo(dragEnd.x, dragEnd.y); ctx.stroke();
+    }
+}
+
+function updateUI() {
+    if (!particleFilter || !robot) return;
+
+    const est = particleFilter.getEstimate();
+    const error = MathUtils.dist(robot.pose, est) / METERS_TO_PIXELS;
+    const odomErr = MathUtils.dist(robot.pose, robot.odomPose) / METERS_TO_PIXELS;
+    
+    document.getElementById('pos-error').innerText = error.toFixed(3) + " m";
+    document.getElementById('odom-error').innerText = odomErr.toFixed(3) + " m";
+    document.getElementById('path-len').innerText = robot.path ? robot.path.length + " pts" : "None";
+    
+    let st = interactionMode === 'INIT_POSE' ? "SET POSE" : (robot.path ? "FOLLOWING PATH" : "IDLE");
+    document.getElementById('status-text').innerText = st;
+}
+
+function loop() {
+    const now = Date.now();
+    const dt = (now - lastTime) / 1000;
+    lastTime = now;
+
+    // Safety check for init
+    if (robot && particleFilter) {
+        const ctrl = computeControl();
+        const odomDelta = robot.move(ctrl.v, ctrl.w, dt, world.walls);
+        
+        if(Math.abs(odomDelta.lin) > 0.1 || Math.abs(odomDelta.ang) > 0.001) {
+            particleFilter.predict(odomDelta);
+            const realScan = robot.lidar.scan(robot.pose, world.walls, CONF.noise.lidar);
+            particleFilter.update(realScan);
+            particleFilter.resample();
+        }
+    }
+
+    draw();
+    if(Math.random()>0.9) updateUI();
+    requestAnimationFrame(loop);
+}
+
+// Events
+canvas.addEventListener('mousedown', e => {
+    const r = canvas.getBoundingClientRect();
+    const x = e.clientX - r.left, y = e.clientY - r.top;
+    
+    if(interactionMode==='GOAL') {
+        // PLAN PATH
+        if (!particleFilter || !planner) return;
+        const est = particleFilter.getEstimate();
+        console.log("Planning path...");
+        const path = planner.plan({x:est.x, y:est.y}, {x:x, y:y});
+        if (path) {
+            robot.path = path;
+            robot.pathIndex = 0;
+            console.log("Path found!", path.length);
+        } else {
+            console.log("Failed to find path");
+        }
+    }
+    else { dragStart={x,y}; dragEnd={x,y}; }
+});
+canvas.addEventListener('mousemove', e => {
+    if(interactionMode==='INIT_POSE' && dragStart) {
+        const r = canvas.getBoundingClientRect();
+        dragEnd = {x: e.clientX-r.left, y: e.clientY-r.top};
+    }
+});
+canvas.addEventListener('mouseup', e => {
+    if(interactionMode==='INIT_POSE' && dragStart && particleFilter) {
+        const r = canvas.getBoundingClientRect();
+        const ex = e.clientX-r.left, ey = e.clientY-r.top;
+        let th = (MathUtils.dist(dragStart,{x:ex,y:ey})<10)?0:Math.atan2(ey-dragStart.y, ex-dragStart.x);
+        particleFilter.setEstimatedPose(dragStart.x, dragStart.y, th);
+        robot.odomPose = {x:dragStart.x, y:dragStart.y, theta:th}; 
+        dragStart=null; toggleInitPoseMode();
+    }
+});
+window.addEventListener('resize', resetSimulation);
+
+init();
+loop();
+</script>
+</body>
+</html>
